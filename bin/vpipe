@@ -8,9 +8,13 @@
 set -euo pipefail
 
 readonly DEFAULT_MODEL=small
+readonly DEFAULT_ASR=auto
 readonly DEFAULT_HOOK_SECONDS=5
 readonly DEFAULT_HOOK_FPS=2
 readonly DEFAULT_BODY_FPS=0.5
+
+# Resolve alongside this script so vtranscribe is found however vpipe is called.
+readonly script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 
 usage() {
   cat <<'USAGE'
@@ -21,7 +25,11 @@ transcribes it, and extracts frames — dense on the hook, sparse after.
 
 Options:
   -o, --out DIR          Output directory (default: out/<video-id>)
-  -m, --model NAME       Whisper model: tiny|base|small|medium|large (default: small)
+  -m, --model NAME       Whisper model: tiny|base|small|medium (default: small)
+                         Add .en for English-only, e.g. small.en
+      --asr BACKEND      onnx|whisper|auto (default: auto)
+                         onnx    = whisper via sherpa-onnx, no torch needed
+                         whisper = the openai-whisper CLI
       --hook SECONDS     Length of the hook window (default: 5)
       --hook-fps N       Frames per second over the hook (default: 2)
       --body-fps N       Frames per second after the hook (default: 0.5)
@@ -84,6 +92,7 @@ write_manifest() {
 url=""
 out_dir=""
 model=$DEFAULT_MODEL
+asr=$DEFAULT_ASR
 hook_seconds=$DEFAULT_HOOK_SECONDS
 hook_fps=$DEFAULT_HOOK_FPS
 body_fps=$DEFAULT_BODY_FPS
@@ -96,6 +105,7 @@ while [[ $# -gt 0 ]]; do
   case $1 in
     -o|--out)         out_dir=${2:?--out needs a directory}; shift 2 ;;
     -m|--model)       model=${2:?--model needs a name}; shift 2 ;;
+    --asr)            asr=${2:?--asr needs a backend}; shift 2 ;;
     --hook)           hook_seconds=${2:?--hook needs a number}; shift 2 ;;
     --hook-fps)       hook_fps=${2:?--hook-fps needs a number}; shift 2 ;;
     --body-fps)       body_fps=${2:?--body-fps needs a number}; shift 2 ;;
@@ -115,6 +125,11 @@ if [[ -z $url ]]; then
   [[ $skip_download == 1 ]] || { usage >&2; exit 2; }
   [[ -n $out_dir ]] || die "--skip-download without a url needs --out DIR"
 fi
+
+case $asr in
+  auto|onnx|whisper) ;;
+  *) die "--asr must be auto, onnx or whisper (got '$asr')" ;;
+esac
 
 for n in "$hook_seconds:--hook" "$hook_fps:--hook-fps" "$body_fps:--body-fps"; do
   [[ ${n%%:*} =~ ^[0-9]+(\.[0-9]+)?$ ]] || die "${n#*:} must be a number, got '${n%%:*}'"
@@ -157,14 +172,34 @@ if [[ $DRY_RUN == 0 && ! -f $video ]]; then
   die "no video at $video"
 fi
 
-# 2. Transcript.
+# 2. Transcript. Two backends produce the same video.txt: vtranscribe (whisper
+#    through onnxruntime — no torch, and weights come from GitHub) or the
+#    openai-whisper CLI. `auto` prefers vtranscribe and falls back to whisper,
+#    so an existing whisper install still works if sherpa-onnx isn't there.
 if [[ $skip_transcript == 0 ]]; then
-  require whisper
-  log "Transcribing (model: $model)"
-  run whisper "$video" \
-    --model "$model" \
-    --output_format txt \
-    --output_dir "$out_dir"
+  backend=$asr
+  if [[ $backend == auto ]]; then
+    if [[ -x "$script_dir/vtranscribe" ]] && python3 -c 'import sherpa_onnx' 2>/dev/null; then
+      backend=onnx
+    else
+      backend=whisper
+    fi
+  fi
+
+  if [[ $backend == onnx ]]; then
+    require python3
+    log "Transcribing (sherpa-onnx, model: $model)"
+    run "$script_dir/vtranscribe" "$video" \
+      --model "$model" \
+      --out "$out_dir/video.txt"
+  else
+    require whisper
+    log "Transcribing (openai-whisper, model: $model)"
+    run whisper "$video" \
+      --model "$model" \
+      --output_format txt \
+      --output_dir "$out_dir"
+  fi
 else
   log "Skipping transcript"
 fi

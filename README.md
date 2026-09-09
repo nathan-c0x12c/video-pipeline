@@ -14,10 +14,19 @@ Everything runs locally — no VM, no API key, no GPU.
 
 ```bash
 brew install yt-dlp ffmpeg      # ffmpeg brings ffprobe with it
-pip install openai-whisper
+pip install sherpa-onnx
 ```
 
-On Debian/Ubuntu: `sudo apt install ffmpeg && pip install yt-dlp openai-whisper`.
+On Debian/Ubuntu: `sudo apt install ffmpeg && pip install yt-dlp sherpa-onnx`.
+On Windows: `winget install yt-dlp.yt-dlp Gyan.FFmpeg && pip install sherpa-onnx`.
+
+`sherpa-onnx` runs Whisper through onnxruntime instead of torch — about 30MB
+installed rather than 2.5GB, and the weights come from GitHub releases. Models
+download on first use into `~/.cache/vpipe-models`.
+
+The original `openai-whisper` CLI still works if you prefer it: install it and
+pass `--asr whisper`. With `--asr auto` (the default) vpipe uses sherpa-onnx when
+it's importable and falls back to the whisper CLI when it isn't.
 
 Then put `bin/` on your PATH, or call the script directly:
 
@@ -34,7 +43,8 @@ vpipe <url> [options]
 | Option | Default | What it does |
 | --- | --- | --- |
 | `-o, --out DIR` | `out/<video-id>` | Where everything lands |
-| `-m, --model NAME` | `small` | Whisper model: `tiny`…`large` |
+| `-m, --model NAME` | `small` | Whisper model: `tiny`…`medium`, or `.en` variants like `small.en` |
+| `--asr BACKEND` | `auto` | `onnx`, `whisper`, or `auto` |
 | `--hook SECONDS` | `5` | Length of the hook window |
 | `--hook-fps N` | `2` | Frames per second over the hook |
 | `--body-fps N` | `0.5` | Frames per second after it |
@@ -49,7 +59,7 @@ vpipe <url> [options]
 out/<video-id>/
 ├── video.mp4
 ├── video.info.json     # caption, author, view/like counts, duration
-├── video.txt           # transcript
+├── video.txt           # transcript, one timestamped line per speech segment
 └── frames/
     ├── index.tsv       # frame → approximate timestamp, for aligning to the transcript
     ├── hook_001.jpg    # first 5s @ 2fps  → 10 frames
@@ -122,10 +132,17 @@ directly is strictly more information than relaying them through text.
 
 ## Notes
 
-- Whisper's first run downloads the model (`small` is ~460MB), so that one is slow.
-  Later runs reuse the cached weights.
-- `small` is a good default for English. Drop to `base` if you're batching a lot,
-  go to `medium` for accents or noisy audio.
+- The first run downloads the model (`small` is ~640MB), so that one is slow.
+  Later runs reuse the cached weights in `~/.cache/vpipe-models`.
+- `small` is a good default. Drop to `base` if you're batching a lot, go to
+  `medium` for accents or noisy audio. The `.en` variants are a little sharper on
+  English and a little smaller.
+- Transcript lines carry `[start -> end]` timestamps, which is what lets the
+  analysis line spoken words up against frames. `bin/vtranscribe --plain` drops
+  them if you just want the text.
+- Speech is cut on silence before transcription, because Whisper's encoder only
+  takes 30 seconds at a time. On a video with no detectable speech — music only,
+  say — it falls back to fixed 25s windows rather than returning nothing.
 - Videos shorter than the hook window skip body frames rather than failing.
 - `out/` is gitignored — the downloaded media stays local.
 - Frame timestamps in `index.tsv` are computed from the sample rate, not read
