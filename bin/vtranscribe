@@ -1,0 +1,255 @@
+#!/usr/bin/env python3
+"""
+vtranscribe — transcribe a video or audio file to timestamped text.
+
+Uses Whisper via sherpa-onnx (ONNX runtime) rather than openai-whisper. Two
+reasons: the weights come from GitHub releases instead of openaipublic, and it
+needs no torch — the runtime is ~30MB against ~2.5GB.
+
+Speech is segmented with Silero VAD before decoding. Whisper's encoder only
+takes 30 seconds at a time, so long audio has to be cut somewhere; cutting on
+silence rather than on a fixed grid avoids slicing through the middle of a word,
+and hands back a start/end time per segment as a side effect. Those timestamps
+are what let the analysis prompts line the transcript up against frames.
+"""
+
+import argparse
+import os
+import shutil
+import subprocess
+import sys
+import tarfile
+import urllib.request
+
+SAMPLE_RATE = 16000
+RELEASE = "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models"
+VAD_URL = f"{RELEASE}/silero_vad.onnx"
+
+# Whisper's encoder consumes a fixed 30s window. Cap VAD segments below that so
+# a segment can never be truncated mid-sentence.
+MAX_SEGMENT_SECONDS = 25.0
+
+DEFAULT_MODELS_DIR = os.path.expanduser("~/.cache/vpipe-models")
+
+
+def log(msg):
+    print(f"\033[1;34m==>\033[0m {msg}", file=sys.stderr)
+
+
+def die(msg):
+    print(f"vtranscribe: {msg}", file=sys.stderr)
+    sys.exit(1)
+
+
+def download(url, dest):
+    """Fetch url to dest. Progress redraws in place, so only show it on a tty —
+    piped or logged, the carriage returns turn into thousands of lines."""
+    tmp = f"{dest}.part"
+    tty = sys.stderr.isatty()
+    last = [-1]
+
+    def hook(count, block, total):
+        if total <= 0 or not tty:
+            return
+        pct = min(100, count * block * 100 // total)
+        if pct != last[0]:
+            last[0] = pct
+            print(f"\r    {pct:3d}%  of {total / 1e6:.0f}MB", end="", file=sys.stderr)
+
+    try:
+        urllib.request.urlretrieve(url, tmp, hook)
+    except Exception as e:  # noqa: BLE001 - surface the URL, whatever the cause
+        if os.path.exists(tmp):
+            os.remove(tmp)
+        die(f"could not download {url}\n  {e}")
+    if tty:
+        print("", file=sys.stderr)
+    os.replace(tmp, dest)
+
+
+def ensure_model(name, models_dir):
+    """Return the directory holding model `name`, downloading it if absent."""
+    target = os.path.join(models_dir, f"sherpa-onnx-whisper-{name}")
+    if os.path.isdir(target):
+        return target
+
+    os.makedirs(models_dir, exist_ok=True)
+    url = f"{RELEASE}/sherpa-onnx-whisper-{name}.tar.bz2"
+    archive = os.path.join(models_dir, f"{name}.tar.bz2")
+    log(f"Fetching whisper model '{name}' (first run only)")
+    download(url, archive)
+
+    with tarfile.open(archive, "r:bz2") as tar:
+        tar.extractall(models_dir)
+    os.remove(archive)
+
+    if not os.path.isdir(target):
+        die(f"model archive did not contain {target}")
+    return target
+
+
+def ensure_vad(models_dir):
+    path = os.path.join(models_dir, "silero_vad.onnx")
+    if not os.path.exists(path):
+        os.makedirs(models_dir, exist_ok=True)
+        log("Fetching Silero VAD model (first run only)")
+        download(VAD_URL, path)
+    return path
+
+
+def model_files(model_dir, name, precision):
+    """Pick the encoder/decoder pair, preferring int8 when it's there."""
+    def pick(kind):
+        int8 = os.path.join(model_dir, f"{name}-{kind}.int8.onnx")
+        full = os.path.join(model_dir, f"{name}-{kind}.onnx")
+        if precision == "int8" and os.path.exists(int8):
+            return int8
+        if os.path.exists(full):
+            return full
+        if os.path.exists(int8):
+            return int8
+        die(f"no {kind} found in {model_dir}")
+
+    tokens = os.path.join(model_dir, f"{name}-tokens.txt")
+    if not os.path.exists(tokens):
+        die(f"no tokens file in {model_dir}")
+    return pick("encoder"), pick("decoder"), tokens
+
+
+def decode_audio(path):
+    """Decode any media file to mono 16kHz float32 samples via ffmpeg."""
+    if not shutil.which("ffmpeg"):
+        die("ffmpeg not found. See the README for install instructions.")
+
+    proc = subprocess.run(
+        ["ffmpeg", "-nostdin", "-v", "error", "-i", path,
+         "-f", "s16le", "-ac", "1", "-ar", str(SAMPLE_RATE), "-"],
+        capture_output=True,
+    )
+    if proc.returncode != 0:
+        die(f"ffmpeg could not read {path}\n{proc.stderr.decode(errors='replace').strip()}")
+
+    import numpy as np
+    if not proc.stdout:
+        die(f"no audio track in {path}")
+    return np.frombuffer(proc.stdout, dtype=np.int16).astype(np.float32) / 32768.0
+
+
+def segment(samples, vad_path):
+    """Split samples into (start_seconds, chunk) on silence boundaries."""
+    import sherpa_onnx
+
+    config = sherpa_onnx.VadModelConfig()
+    config.silero_vad.model = vad_path
+    config.silero_vad.threshold = 0.5
+    config.silero_vad.min_silence_duration = 0.25
+    config.silero_vad.min_speech_duration = 0.25
+    config.silero_vad.max_speech_duration = MAX_SEGMENT_SECONDS
+    config.sample_rate = SAMPLE_RATE
+
+    vad = sherpa_onnx.VoiceActivityDetector(config, buffer_size_in_seconds=60)
+    window = config.silero_vad.window_size
+
+    segments = []
+    for i in range(0, len(samples), window):
+        chunk = samples[i:i + window]
+        if len(chunk) < window:
+            break
+        vad.accept_waveform(chunk)
+        while not vad.empty():
+            segments.append((vad.front.start / SAMPLE_RATE, vad.front.samples))
+            vad.pop()
+
+    vad.flush()
+    while not vad.empty():
+        segments.append((vad.front.start / SAMPLE_RATE, vad.front.samples))
+        vad.pop()
+
+    # Music, heavy effects or a very quiet mix can leave VAD with nothing. Fall
+    # back to a fixed grid so we still transcribe something rather than nothing.
+    if not segments:
+        log("VAD found no speech — falling back to fixed windows")
+        step = int(MAX_SEGMENT_SECONDS * SAMPLE_RATE)
+        segments = [(i / SAMPLE_RATE, samples[i:i + step])
+                    for i in range(0, len(samples), step)]
+    return segments
+
+
+def timestamp(seconds):
+    return f"{int(seconds // 60):02d}:{seconds % 60:05.2f}"
+
+
+def main():
+    ap = argparse.ArgumentParser(
+        description="Transcribe a video/audio file to timestamped text.")
+    ap.add_argument("input", help="video or audio file")
+    ap.add_argument("-o", "--out", help="output file (default: <input>.txt)")
+    ap.add_argument("-m", "--model", default="small.en",
+                    help="whisper model: tiny.en|base.en|small.en|medium.en, "
+                         "or multilingual tiny|base|small|medium (default: small.en)")
+    ap.add_argument("--models-dir", default=DEFAULT_MODELS_DIR,
+                    help=f"where model weights are cached (default: {DEFAULT_MODELS_DIR})")
+    ap.add_argument("--precision", choices=("int8", "fp32"), default="int8",
+                    help="int8 is ~2x faster with little accuracy cost (default: int8)")
+    ap.add_argument("--plain", action="store_true",
+                    help="write text only, without [start -> end] timestamps")
+    args = ap.parse_args()
+
+    if not os.path.exists(args.input):
+        die(f"no such file: {args.input}")
+
+    try:
+        import sherpa_onnx  # noqa: F401
+        import numpy  # noqa: F401
+    except ImportError:
+        die("sherpa-onnx not installed. Run: pip install sherpa-onnx")
+
+    import sherpa_onnx
+
+    out = args.out or os.path.splitext(args.input)[0] + ".txt"
+
+    model_dir = ensure_model(args.model, args.models_dir)
+    vad_path = ensure_vad(args.models_dir)
+    encoder, decoder, tokens = model_files(model_dir, args.model, args.precision)
+
+    log(f"Decoding audio from {args.input}")
+    samples = decode_audio(args.input)
+    duration = len(samples) / SAMPLE_RATE
+
+    log(f"Segmenting {duration:.1f}s of audio")
+    segments = segment(samples, vad_path)
+
+    log(f"Transcribing {len(segments)} segment(s) with whisper {args.model}")
+    recognizer = sherpa_onnx.OfflineRecognizer.from_whisper(
+        encoder=encoder, decoder=decoder, tokens=tokens,
+    )
+
+    lines = []
+    for i, (start, chunk) in enumerate(segments, 1):
+        stream = recognizer.create_stream()
+        stream.accept_waveform(SAMPLE_RATE, chunk)
+        recognizer.decode_stream(stream)
+        text = stream.result.text.strip()
+        if sys.stderr.isatty():
+            print(f"\r    segment {i}/{len(segments)}", end="", file=sys.stderr)
+        if not text:
+            continue
+        if args.plain:
+            lines.append(text)
+        else:
+            end = start + len(chunk) / SAMPLE_RATE
+            lines.append(f"[{timestamp(start)} -> {timestamp(end)}]  {text}")
+    if sys.stderr.isatty():
+        print("", file=sys.stderr)
+
+    os.makedirs(os.path.dirname(os.path.abspath(out)), exist_ok=True)
+    with open(out, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines) + ("\n" if lines else ""))
+
+    if not lines:
+        log("No speech found — transcript is empty")
+    log(f"Transcript -> {out}")
+
+
+if __name__ == "__main__":
+    main()
