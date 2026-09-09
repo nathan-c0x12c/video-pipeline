@@ -1,0 +1,6 @@
+out/
+*.mp4
+*.jpg
+*.info.json
+.DS_Store
+__pycache__/

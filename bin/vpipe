@@ -1,0 +1,184 @@
+#!/usr/bin/env bash
+#
+# vpipe — download a short-form video and produce a transcript + sampled frames.
+#
+# Frame sampling is deliberately uneven: dense over the hook (the first few
+# seconds decide whether a viewer stays), sparse over the body.
+
+set -euo pipefail
+
+readonly DEFAULT_MODEL=small
+readonly DEFAULT_HOOK_SECONDS=5
+readonly DEFAULT_HOOK_FPS=2
+readonly DEFAULT_BODY_FPS=0.5
+
+usage() {
+  cat <<'USAGE'
+Usage: vpipe <url> [options]
+
+Downloads a video (TikTok, IG Reels, YouTube Shorts, anything yt-dlp handles),
+transcribes it, and extracts frames — dense on the hook, sparse after.
+
+Options:
+  -o, --out DIR          Output directory (default: out/<video-id>)
+  -m, --model NAME       Whisper model: tiny|base|small|medium|large (default: small)
+      --hook SECONDS     Length of the hook window (default: 5)
+      --hook-fps N       Frames per second over the hook (default: 2)
+      --body-fps N       Frames per second after the hook (default: 0.5)
+      --skip-download    Reuse video.mp4 already in the output directory
+      --skip-transcript  Don't run whisper
+      --skip-frames      Don't extract frames
+  -n, --dry-run          Print the commands instead of running them
+  -h, --help             Show this message
+
+Examples:
+  vpipe "https://www.tiktok.com/@user/video/123"
+  vpipe "https://youtube.com/shorts/abc" -o out/abc --model medium
+  vpipe "https://instagram.com/reel/xyz" --hook 3 --hook-fps 4
+USAGE
+}
+
+die() { printf 'vpipe: %s\n' "$*" >&2; exit 1; }
+log() { printf '\033[1;34m==>\033[0m %s\n' "$*" >&2; }
+
+# Print a command, and run it unless we're in dry-run mode.
+run() {
+  printf '\033[2m  $ %s\033[0m\n' "$*" >&2
+  [[ $DRY_RUN == 1 ]] && return 0
+  "$@"
+}
+
+require() {
+  # In dry-run we only print commands, so a missing tool isn't fatal.
+  if ! command -v "$1" >/dev/null 2>&1; then
+    [[ $DRY_RUN == 1 ]] && return 0
+    die "$1 not found. See the README for install instructions."
+  fi
+}
+
+url=""
+out_dir=""
+model=$DEFAULT_MODEL
+hook_seconds=$DEFAULT_HOOK_SECONDS
+hook_fps=$DEFAULT_HOOK_FPS
+body_fps=$DEFAULT_BODY_FPS
+skip_download=0
+skip_transcript=0
+skip_frames=0
+DRY_RUN=0
+
+while [[ $# -gt 0 ]]; do
+  case $1 in
+    -o|--out)         out_dir=${2:?--out needs a directory}; shift 2 ;;
+    -m|--model)       model=${2:?--model needs a name}; shift 2 ;;
+    --hook)           hook_seconds=${2:?--hook needs a number}; shift 2 ;;
+    --hook-fps)       hook_fps=${2:?--hook-fps needs a number}; shift 2 ;;
+    --body-fps)       body_fps=${2:?--body-fps needs a number}; shift 2 ;;
+    --skip-download)  skip_download=1; shift ;;
+    --skip-transcript) skip_transcript=1; shift ;;
+    --skip-frames)    skip_frames=1; shift ;;
+    -n|--dry-run)     DRY_RUN=1; shift ;;
+    -h|--help)        usage; exit 0 ;;
+    -*)               die "unknown option: $1 (try --help)" ;;
+    *)
+      [[ -n $url ]] && die "only one url at a time (got '$url' and '$1')"
+      url=$1; shift ;;
+  esac
+done
+
+if [[ -z $url ]]; then
+  [[ $skip_download == 1 ]] || { usage >&2; exit 2; }
+  [[ -n $out_dir ]] || die "--skip-download without a url needs --out DIR"
+fi
+
+for n in "$hook_seconds:--hook" "$hook_fps:--hook-fps" "$body_fps:--body-fps"; do
+  [[ ${n%%:*} =~ ^[0-9]+(\.[0-9]+)?$ ]] || die "${n#*:} must be a number, got '${n%%:*}'"
+done
+
+# Default the output directory to the video's own id, so repeated runs against
+# different videos don't clobber each other.
+if [[ -z $out_dir ]]; then
+  if [[ $DRY_RUN == 1 ]]; then
+    video_id='<video-id>'
+  else
+    require yt-dlp
+    log "Resolving video id"
+    video_id=$(yt-dlp --print id --no-warnings "$url") \
+      || die "could not resolve the video id — is the url reachable?"
+  fi
+  out_dir="out/$video_id"
+fi
+
+video="$out_dir/video.mp4"
+frames_dir="$out_dir/frames"
+
+run mkdir -p "$out_dir"
+
+# 1. Download. --write-info-json keeps the caption, author and counts alongside
+#    the media, which is usually what you actually want to analyse.
+if [[ $skip_download == 0 ]]; then
+  require yt-dlp
+  log "Downloading"
+  run yt-dlp "$url" \
+    --output "$video" \
+    --write-info-json \
+    --no-playlist \
+    --quiet --progress
+else
+  log "Skipping download"
+fi
+
+if [[ $DRY_RUN == 0 && ! -f $video ]]; then
+  die "no video at $video"
+fi
+
+# 2. Transcript.
+if [[ $skip_transcript == 0 ]]; then
+  require whisper
+  log "Transcribing (model: $model)"
+  run whisper "$video" \
+    --model "$model" \
+    --output_format txt \
+    --output_dir "$out_dir"
+else
+  log "Skipping transcript"
+fi
+
+# 3. Frames — dense over the hook, sparse over the body.
+if [[ $skip_frames == 0 ]]; then
+  require ffmpeg
+  log "Extracting frames (hook: ${hook_seconds}s @ ${hook_fps}fps, body @ ${body_fps}fps)"
+  run mkdir -p "$frames_dir"
+
+  run ffmpeg -nostdin -loglevel error -y \
+    -i "$video" -t "$hook_seconds" \
+    -vf "fps=$hook_fps" "$frames_dir/hook_%03d.jpg"
+
+  # Only sample the body if the video actually outlasts the hook window;
+  # otherwise ffmpeg exits non-zero on an empty input range. If we can't read
+  # the duration we attempt it anyway and tolerate a failure.
+  duration=""
+  if [[ $DRY_RUN == 0 ]]; then
+    duration=$(ffprobe -v error -show_entries format=duration \
+      -of default=noprint_wrappers=1:nokey=1 "$video" 2>/dev/null || true)
+  fi
+
+  if [[ $duration =~ ^[0-9]+(\.[0-9]+)?$ ]] \
+     && ! awk -v d="$duration" -v h="$hook_seconds" 'BEGIN{exit !(d>h)}'; then
+    log "Video is ${duration}s — shorter than the hook window, no body frames"
+  else
+    run ffmpeg -nostdin -loglevel error -y \
+      -ss "$hook_seconds" -i "$video" \
+      -vf "fps=$body_fps" "$frames_dir/body_%03d.jpg" \
+      || log "No body frames extracted"
+  fi
+else
+  log "Skipping frames"
+fi
+
+log "Done → $out_dir"
+if [[ $DRY_RUN == 0 ]]; then
+  find "$out_dir" -maxdepth 1 -type f -printf '  %f\n' 2>/dev/null | sort
+  [[ -d $frames_dir ]] \
+    && printf '  frames/ (%s images)\n' "$(find "$frames_dir" -name '*.jpg' | wc -l | tr -d ' ')"
+fi
