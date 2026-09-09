@@ -56,6 +56,31 @@ require() {
   fi
 }
 
+# Write a frame -> timestamp map. Frame filenames alone don't say when they
+# happened, and the analysis is only as good as its ability to line frames up
+# against the transcript.
+write_manifest() {
+  local manifest="$frames_dir/index.tsv"
+  {
+    printf 'file\tapprox_seconds\tsegment\n'
+    local n=0
+    for f in "$frames_dir"/hook_*.jpg; do
+      [[ -e $f ]] || break
+      awk -v f="${f##*/}" -v n="$n" -v r="$hook_fps" \
+        'BEGIN{printf "%s\t%.2f\thook\n", f, n/r}'
+      n=$((n + 1))
+    done
+    n=0
+    for f in "$frames_dir"/body_*.jpg; do
+      [[ -e $f ]] || break
+      awk -v f="${f##*/}" -v n="$n" -v r="$body_fps" -v o="$hook_seconds" \
+        'BEGIN{printf "%s\t%.2f\tbody\n", f, o + n/r}'
+      n=$((n + 1))
+    done
+  } > "$manifest"
+  log "Frame index → $manifest"
+}
+
 url=""
 out_dir=""
 model=$DEFAULT_MODEL
@@ -172,6 +197,8 @@ if [[ $skip_frames == 0 ]]; then
       -vf "fps=$body_fps" "$frames_dir/body_%03d.jpg" \
       || log "No body frames extracted"
   fi
+
+  if [[ $DRY_RUN == 0 ]]; then write_manifest; fi
 else
   log "Skipping frames"
 fi
