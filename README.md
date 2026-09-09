@@ -5,7 +5,10 @@ transcript and a set of frames. Frames are sampled unevenly on purpose — dense
 over the hook, sparse over the body — because the first few seconds are what
 decide whether anyone watches the rest.
 
+Then Claude reads the result and tells you why the video works.
+
 Works on anything `yt-dlp` handles: TikTok, Instagram Reels, YouTube Shorts.
+Everything runs locally — no VM, no API key, no GPU.
 
 ## Install
 
@@ -48,6 +51,7 @@ out/<video-id>/
 ├── video.info.json     # caption, author, view/like counts, duration
 ├── video.txt           # transcript
 └── frames/
+    ├── index.tsv       # frame → approximate timestamp, for aligning to the transcript
     ├── hook_001.jpg    # first 5s @ 2fps  → 10 frames
     ├── ...
     └── body_001.jpg    # the rest @ 0.5fps → 1 frame / 2s
@@ -72,6 +76,50 @@ vpipe --skip-download --skip-transcript -o out/123 --hook-fps 6
 vpipe "https://www.tiktok.com/@user/video/123" --dry-run
 ```
 
+## Analysis
+
+The pipeline produces the inputs. Claude is the brain — no vision API to
+configure, nothing to self-host.
+
+```bash
+./bin/vpipe "https://www.tiktok.com/@user/video/123"
+```
+
+Then, in Claude Code from the repo root:
+
+```
+Follow prompts/01-observe.md for out/123
+Follow prompts/02-teardown.md for out/123
+```
+
+Two stages, deliberately:
+
+| Stage | Produces | Job |
+| --- | --- | --- |
+| `01-observe.md` | `observation.md` | What is on screen, frame by frame. **No interpretation.** |
+| `02-teardown.md` | `teardown.md` | Why it works — every claim citing a timestamp. |
+
+Splitting them is the whole point. Ask for a verdict directly and you get
+confident narration of things that were never on screen. Stage 1 pins down what
+is actually there, and stage 2 has to cite it. Run stage 1 alone when you only
+want a record of what happens.
+
+`frames/index.tsv` maps each frame to its timestamp, which is what lets Claude
+line frames up against the transcript. Without it, frame filenames carry no
+timing.
+
+### Where the prompts came from
+
+The observation/synthesis split, the continuity discipline, and "avoid
+interpretation — stick to what you can see" are adapted from
+[byjlw/video-analyzer](https://github.com/byjlw/video-analyzer).
+
+Its *architecture* is not reused, on purpose. That tool describes one frame at a
+time and then synthesises a summary from **frame 1 plus text notes** of the
+rest — a necessary workaround for local vision models that take a single image
+with tight context. Claude reads every frame together, so passing frames
+directly is strictly more information than relaying them through text.
+
 ## Notes
 
 - Whisper's first run downloads the model (`small` is ~460MB), so that one is slow.
@@ -80,3 +128,7 @@ vpipe "https://www.tiktok.com/@user/video/123" --dry-run
   go to `medium` for accents or noisy audio.
 - Videos shorter than the hook window skip body frames rather than failing.
 - `out/` is gitignored — the downloaded media stays local.
+- Frame timestamps in `index.tsv` are computed from the sample rate, not read
+  back from the file. They're accurate to within a frame interval.
+- Frames are samples. A 2-second gap between body frames can hide an entire
+  shot — the prompts treat that as something to report, not paper over.
