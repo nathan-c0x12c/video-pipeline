@@ -1,0 +1,21 @@
+{
+  "_source": "Metadata could not be fetched with yt-dlp: tiktok.com is blocked by this environment's network policy. Fields below were read off the TikTok screenshots supplied with the request, except duration/width/height/fps which come from ffprobe on the uploaded file.",
+  "id": "7517648679847693623",
+  "webpage_url": "https://www.tiktok.com/@realeater.flou/video/7517648679847693623",
+  "uploader_id": "realeater.flou",
+  "uploader": "Lucious ~ Building BiteSight",
+  "upload_date": "2025-06-19",
+  "title": "It's called BiteSight and it's really fun I promise :) #foodelivery ...",
+  "description": "It's called BiteSight and it's really fun I promise :) #foodelivery ... [caption truncated in the screenshot; the 'more' link was not expanded]",
+  "location": "The High Line, New York",
+  "duration": 35.17,
+  "width": 576,
+  "height": 1024,
+  "fps": 30,
+  "like_count": 3800000,
+  "comment_count": 58800,
+  "repost_count": 308800,
+  "share_count": 222200,
+  "view_count": null,
+  "_counts_note": "Read from the screenshot's action rail: 3.8M likes, 58.8K comments, 308.8K saves, 222.2K shares. View count is not shown in the supplied screenshots."
+}
