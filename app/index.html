@@ -113,6 +113,15 @@
     font-size: 13px;
   }
   .muted { color: var(--muted); font-size: 12px; }
+  .warn { color: #ffb4a2; }
+  select {
+    background: #2a2c33;
+    color: var(--text);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 6px 10px;
+    font-size: 13px;
+  }
   .screenshot-list { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; }
   .screenshot-list span { background: #2a2c33; border-radius: 4px; padding: 3px 8px; font-size: 11px; }
 </style>
@@ -129,6 +138,12 @@
       <input type="text" id="urlInput" placeholder="or paste a TikTok / IG / YouTube Shorts URL">
       <button id="urlBtn">Fetch</button>
     </div>
+    <div class="row" style="margin-top:12px">
+      <label class="muted" for="asrModel">Transcription quality</label>
+      <select id="asrModel"></select>
+      <span class="muted" id="asrHint"></span>
+    </div>
+    <div class="muted warn hidden" id="setupWarn" style="margin-top:10px"></div>
   </div>
 
   <div class="panel hidden" id="status-panel">
@@ -167,27 +182,48 @@
   </div>
 
   <div class="panel hidden" id="prompt-panel">
-    <h2>5. Send it to a model</h2>
+    <h2>5. Run the teardown</h2>
+
     <div class="row">
-      <button id="copyBtn">Copy prompt</button>
-      <button class="secondary" id="openFolderBtn">Open folder</button>
-      <span class="muted" id="copyStatus"></span>
+      <label class="muted" for="claudeModel">Model</label>
+      <select id="claudeModel"></select>
+      <button id="analyzeBtn">Analyze here</button>
+      <span class="muted" id="analyzeStatus"></span>
     </div>
-    <div class="links" style="margin-top:10px">
-      <a href="https://claude.ai/new" target="_blank">Open Claude</a>
-      <a href="https://chatgpt.com/" target="_blank">Open ChatGPT</a>
-      <a href="https://gemini.google.com/app" target="_blank">Open Gemini</a>
+    <div class="muted" style="margin-top:6px">
+      Runs on this machine through the <code>claude</code> command you're
+      already signed in to. No API key, nothing billed per video. Writes
+      <code>teardown.md</code> next to the video when it's done.
     </div>
-    <textarea id="promptBox" rows="10" readonly style="margin-top:10px" placeholder="Click Copy prompt to generate it"></textarea>
+    <div class="muted warn hidden" id="analyzeError" style="margin-top:8px"></div>
+
+    <details style="margin-top:16px">
+      <summary class="muted">Or copy the prompt and paste it into a chat instead</summary>
+      <div class="row" style="margin-top:10px">
+        <button class="secondary" id="copyBtn">Copy prompt</button>
+        <button class="secondary" id="openFolderBtn">Open folder</button>
+        <span class="muted" id="copyStatus"></span>
+      </div>
+      <div class="links" style="margin-top:10px">
+        <a href="https://claude.ai/new" target="_blank">Open Claude</a>
+        <a href="https://chatgpt.com/" target="_blank">Open ChatGPT</a>
+        <a href="https://gemini.google.com/app" target="_blank">Open Gemini</a>
+      </div>
+      <textarea id="promptBox" rows="10" readonly style="margin-top:10px" placeholder="Click Copy prompt to generate it"></textarea>
+    </details>
   </div>
 
   <div class="panel hidden" id="report-panel">
-    <h2>6. Paste the report back</h2>
-    <textarea id="reportInput" rows="12" placeholder="Paste the model's teardown here"></textarea>
-    <div class="row" style="margin-top:8px">
-      <button id="saveReportBtn">Save as teardown.md</button>
-      <span class="muted" id="reportStatus"></span>
-    </div>
+    <h2>6. The teardown</h2>
+    <pre class="transcript hidden" id="teardownBox"></pre>
+    <details style="margin-top:10px" id="pasteBack">
+      <summary class="muted">Paste a report back from a chat instead</summary>
+      <textarea id="reportInput" rows="12" placeholder="Paste the model's teardown here" style="margin-top:10px"></textarea>
+      <div class="row" style="margin-top:8px">
+        <button id="saveReportBtn">Save as teardown.md</button>
+        <span class="muted" id="reportStatus"></span>
+      </div>
+    </details>
   </div>
 </div>
 
@@ -198,6 +234,70 @@ let pollTimer = null;
 
 const $ = (id) => document.getElementById(id);
 const show = (id) => $(id).classList.remove('hidden');
+const hide = (id) => $(id).classList.add('hidden');
+
+// What the transcription models actually cost you, in the terms that matter
+// when you're picking one: speed against accuracy.
+const ASR_BLURB = {
+  'tiny': 'fastest, roughest',
+  'tiny.en': 'fastest, English only',
+  'base': 'fast, fine for clear speech',
+  'base.en': 'fast, English only',
+  'small': 'good default',
+  'small.en': 'good default, English only',
+  'medium': 'slowest, best on accents and noise',
+  'medium.en': 'slowest, best on English',
+};
+const CLAUDE_BLURB = {
+  'opus': 'most capable',
+  'sonnet': 'faster, still strong',
+  'haiku': 'fastest, lightest',
+};
+
+let caps = null;
+
+async function loadCapabilities() {
+  caps = await fetch('/capabilities').then(r => r.json());
+
+  const asr = $('asrModel');
+  asr.innerHTML = '';
+  caps.asr_models.forEach(m => {
+    const o = document.createElement('option');
+    o.value = m;
+    o.textContent = m;
+    if (m === caps.default_asr_model) o.selected = true;
+    asr.appendChild(o);
+  });
+  const updateHint = () => { $('asrHint').textContent = ASR_BLURB[asr.value] || ''; };
+  asr.addEventListener('change', updateHint);
+  updateHint();
+
+  const cm = $('claudeModel');
+  cm.innerHTML = '';
+  caps.claude_models.forEach(m => {
+    const o = document.createElement('option');
+    o.value = m;
+    o.textContent = m + ' — ' + (CLAUDE_BLURB[m] || '');
+    if (m === caps.default_claude_model) o.selected = true;
+    cm.appendChild(o);
+  });
+
+  // Say up front what's missing, rather than letting it fail mid-pipeline.
+  const missing = [];
+  if (!caps.has_ffmpeg) missing.push('ffmpeg is not installed — nothing will run until it is');
+  if (!caps.has_ytdlp) missing.push('yt-dlp is not installed — you can upload files, but pasting a URL will fail');
+  if (!caps.has_claude) missing.push('the `claude` command is not installed — use the copy-the-prompt route instead');
+  if (missing.length) {
+    $('setupWarn').innerHTML = missing.map(m => '⚠ ' + m).join('<br>');
+    show('setupWarn');
+  }
+
+  if (!caps.has_claude) {
+    $('analyzeBtn').disabled = true;
+    $('claudeModel').disabled = true;
+  }
+}
+loadCapabilities();
 
 function setPill(state) {
   const pill = $('statePill');
@@ -233,7 +333,10 @@ $('fileInput').addEventListener('change', (e) => {
 function uploadFile(file) {
   startJob(fetch('/upload', {
     method: 'POST',
-    headers: { 'X-Filename': encodeURIComponent(file.name) },
+    headers: {
+      'X-Filename': encodeURIComponent(file.name),
+      'X-Asr-Model': $('asrModel').value,
+    },
     body: file,
   }).then(r => r.json()));
 }
@@ -244,8 +347,74 @@ $('urlBtn').addEventListener('click', () => {
   startJob(fetch('/url', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ url }),
+    body: JSON.stringify({ url, asr_model: $('asrModel').value }),
   }).then(r => r.json()));
+});
+
+let analysisTimer = null;
+
+function renderAnalysis(data) {
+  const state = data.analysis_state;
+  const status = $('analyzeStatus');
+
+  if (state === 'running') {
+    status.textContent = 'running ' + (data.analysis_model || '') +
+      ' — reading the frames, this takes a minute or two…';
+    $('analyzeBtn').disabled = true;
+    hide('analyzeError');
+  } else if (state === 'done') {
+    status.textContent = 'saved to ' + outDir + '/teardown.md';
+    $('analyzeBtn').disabled = false;
+    $('analyzeBtn').textContent = 'Run again';
+    hide('analyzeError');
+  } else if (state === 'error') {
+    status.textContent = '';
+    $('analyzeBtn').disabled = false;
+    $('analyzeError').textContent = data.analysis_error || 'analysis failed';
+    show('analyzeError');
+  } else {
+    status.textContent = '';
+    $('analyzeBtn').disabled = false;
+  }
+
+  if (data.teardown) {
+    $('teardownBox').textContent = data.teardown;
+    show('teardownBox');
+    // The paste-back box is a fallback; once there's a real report, fold it away.
+    $('pasteBack').open = false;
+  }
+}
+
+// The main poll stops once the pipeline is done, so analysis gets its own loop.
+function pollAnalysis() {
+  clearTimeout(analysisTimer);
+  fetch('/status/' + encodeURIComponent(jobId)).then(r => r.json()).then(data => {
+    renderAnalysis(data);
+    if (data.analysis_state === 'running') {
+      analysisTimer = setTimeout(pollAnalysis, 2000);
+    }
+  });
+}
+
+$('analyzeBtn').addEventListener('click', () => {
+  if (!jobId) return;
+  hide('analyzeError');
+  $('analyzeBtn').disabled = true;
+  $('analyzeStatus').textContent = 'starting…';
+  fetch('/analyze', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ job_id: jobId, model: $('claudeModel').value }),
+  }).then(r => r.json()).then(data => {
+    if (data.error) {
+      $('analyzeStatus').textContent = '';
+      $('analyzeError').textContent = data.error;
+      show('analyzeError');
+      $('analyzeBtn').disabled = false;
+      return;
+    }
+    pollAnalysis();
+  });
 });
 
 function poll() {
@@ -267,6 +436,7 @@ function poll() {
       show('meta-panel');
       show('prompt-panel');
       show('report-panel');
+      renderAnalysis(data);
       return;
     }
     if (data.state === 'error') {

@@ -3,9 +3,11 @@
 vpipe-app — a local page for the video-pipeline teardown workflow.
 
 Runs vpipe end to end (download/transcript/frames/sheet) and serves a page
-to review the result, assemble the analysis prompt, and hand it to whichever
-chat you're logged into — Claude, ChatGPT, Gemini. No API keys: the app's
-job stops at "prompt ready to paste," the same way the manual workflow did.
+to review the result and turn it into a teardown. Two ways out: run the
+analysis here through the local `claude` CLI, which is already signed in to
+a subscription, or copy the prompt and paste it into whichever chat you like
+— Claude, ChatGPT, Gemini. Either way there is no API key to store and
+nothing billed per video.
 
 Stdlib only, on purpose — python3 is already required by vtranscribe, so
 this adds nothing new to install. Binds to 127.0.0.1 only.
@@ -48,6 +50,22 @@ STEP_LABELS = [
     "Done",
 ]
 
+# Both of these are allowlists rather than free text because the value goes
+# straight into an argv for a subprocess. Anything not on the list is refused.
+ASR_MODELS = [
+    "tiny", "tiny.en", "base", "base.en",
+    "small", "small.en", "medium", "medium.en",
+]
+DEFAULT_ASR_MODEL = "small"
+
+# Aliases, not pinned ids — `claude` resolves each to the current model, so
+# this list doesn't go stale every time a new one ships.
+CLAUDE_MODELS = ["opus", "sonnet", "haiku"]
+DEFAULT_CLAUDE_MODEL = "opus"
+
+CLAUDE_BIN = shutil.which("claude")
+AUTH_RE = re.compile(r"authenticat|oauth|login|credential", re.I)
+
 # job_id -> {state, step, log, out_dir, error, link, notes, screenshots}
 JOBS: dict[str, dict] = {}
 JOBS_LOCK = threading.Lock()
@@ -57,6 +75,18 @@ def slugify(filename: str) -> str:
     stem = re.sub(r"\.[^.]+$", "", filename)
     slug = re.sub(r"[^a-zA-Z0-9]+", "_", stem).strip("_").lower()
     return slug or "video"
+
+
+def pick_asr_model(value: str | None) -> str:
+    """Fall back to the default rather than erroring — an unknown model in a
+    query string shouldn't cost someone their upload."""
+    value = (value or "").strip()
+    return value if value in ASR_MODELS else DEFAULT_ASR_MODEL
+
+
+def pick_claude_model(value: str | None) -> str:
+    value = (value or "").strip()
+    return value if value in CLAUDE_MODELS else DEFAULT_CLAUDE_MODEL
 
 
 def strip_ansi(text: str) -> str:
@@ -153,10 +183,22 @@ def new_job(out_dir_hint: str | None = None) -> dict:
         "link": "",
         "notes": "",
         "screenshots": [],
+        # Analysis runs as a second, separate job on the same record: the
+        # pipeline can be "done" while the teardown is still being written.
+        "analysis_state": "idle",  # idle | running | done | error
+        "analysis_error": None,
+        "analysis_model": "",
     }
 
 
-def build_prompt(job: dict) -> str:
+def build_prompt(job: dict, local: bool = False) -> str:
+    """Assemble the teardown prompt.
+
+    `local=True` targets `claude -p`, which has no attachments but can open
+    files itself — so the images become paths to read rather than things
+    claimed to be attached. Everything below that line is identical, which is
+    the point: the two routes must not drift into asking for different work.
+    """
     out_dir_abs = REPO_ROOT / job["out_dir"]
     transcript_path = out_dir_abs / "video.txt"
     transcript = transcript_path.read_text(encoding="utf-8").strip() if transcript_path.exists() else ""
@@ -172,10 +214,32 @@ def build_prompt(job: dict) -> str:
     if screenshots:
         sheet_note += f", plus {len(screenshots)} screenshot(s): {', '.join(screenshots)}"
 
-    lines = [
-        f"Video: {job.get('link') or '(not given)'}",
-        f"Attached to this message: {sheet_note or '(no frames extracted)'}",
-    ]
+    lines = [f"Video: {job.get('link') or '(not given)'}"]
+    if local:
+        out_rel = job["out_dir"]
+        lines.append(
+            "Read these files before answering — they are the evidence, and "
+            "every claim has to cite them:"
+        )
+        if (out_dir_abs / "sheet.jpg").exists():
+            lines.append(
+                f"  {out_rel}/sheet.jpg — all {len(frames)} frames in timestamp "
+                "order, hook denser than body, each tile labelled H/B + timestamp"
+            )
+        if frames:
+            lines.append(
+                f"  {out_rel}/frames/ — the same frames full-resolution, plus "
+                "index.tsv mapping each one to its timestamp. Open individual "
+                "frames from here when the sheet is too small to read."
+            )
+        for shot in screenshots:
+            lines.append(f"  {out_rel}/screenshots/{shot} — viewer comments")
+        if not frames:
+            lines.append("  (no frames were extracted — work from the transcript alone)")
+    else:
+        lines.append(
+            f"Attached to this message: {sheet_note or '(no frames extracted)'}"
+        )
     if job.get("notes"):
         lines.append(f"Notes from me: {job['notes']}")
     lines.append("")
@@ -191,6 +255,63 @@ def build_prompt(job: dict) -> str:
     lines.append(template_text[idx:] if idx != -1 else template_text)
 
     return "\n".join(lines)
+
+
+def run_analysis(job_id: str, model: str) -> None:
+    """Run the teardown through the local `claude` CLI and save teardown.md.
+
+    This deliberately shells out to the CLI rather than calling the API: the
+    CLI is already signed in to the user's subscription, so there's no API key
+    to store here and nothing billed per video. The cost is that an expired
+    session shows up as a subprocess error, which is why the auth case gets
+    translated into something actionable below.
+    """
+    job = JOBS[job_id]
+    job["analysis_state"] = "running"
+    job["analysis_error"] = None
+    job["analysis_model"] = model
+
+    try:
+        prompt = build_prompt(job, local=True)
+        proc = subprocess.run(
+            [
+                CLAUDE_BIN, "-p", prompt,
+                "--model", model,
+                # Read/Glob only: it needs to open the frames and transcript,
+                # never to edit the repo or run anything.
+                "--allowedTools", "Read", "Glob",
+                "--permission-mode", "dontAsk",
+            ],
+            cwd=str(REPO_ROOT),
+            capture_output=True,
+            text=True,
+            timeout=1800,
+        )
+        output = (proc.stdout or "").strip()
+        stderr = (proc.stderr or "").strip()
+
+        if proc.returncode != 0 or not output:
+            detail = stderr or output or f"claude exited with status {proc.returncode}"
+            if AUTH_RE.search(detail):
+                job["analysis_state"] = "error"
+                job["analysis_error"] = (
+                    "Claude Code isn't signed in. Open Terminal, run:  claude login  "
+                    "— then come back and press Analyze again."
+                )
+                return
+            job["analysis_state"] = "error"
+            job["analysis_error"] = detail[:1000]
+            return
+
+        dest = REPO_ROOT / job["out_dir"] / "teardown.md"
+        dest.write_text(output, encoding="utf-8")
+        job["analysis_state"] = "done"
+    except subprocess.TimeoutExpired:
+        job["analysis_state"] = "error"
+        job["analysis_error"] = "analysis timed out after 30 minutes"
+    except Exception as e:  # noqa: BLE001 - surface it, don't swallow it
+        job["analysis_state"] = "error"
+        job["analysis_error"] = str(e)
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -259,6 +380,18 @@ class Handler(BaseHTTPRequestHandler):
             self._send_file(target)
             return
 
+        if path == "/capabilities":
+            self._send_json({
+                "asr_models": ASR_MODELS,
+                "default_asr_model": DEFAULT_ASR_MODEL,
+                "claude_models": CLAUDE_MODELS,
+                "default_claude_model": DEFAULT_CLAUDE_MODEL,
+                "has_claude": bool(CLAUDE_BIN),
+                "has_ffmpeg": bool(shutil.which("ffmpeg")),
+                "has_ytdlp": bool(shutil.which("yt-dlp")),
+            })
+            return
+
         if path.startswith("/status/"):
             job_id = unquote(path[len("/status/") :])
             job = self._job_or_404(job_id)
@@ -272,6 +405,9 @@ class Handler(BaseHTTPRequestHandler):
                 "link": job["link"],
                 "notes": job["notes"],
                 "screenshots": job["screenshots"],
+                "analysis_state": job["analysis_state"],
+                "analysis_error": job["analysis_error"],
+                "analysis_model": job["analysis_model"],
             }
             if job["out_dir"]:
                 payload["out_dir"] = job["out_dir"]
@@ -284,6 +420,10 @@ class Handler(BaseHTTPRequestHandler):
                 payload["frames"] = read_frames_tsv(out_dir_abs)
                 payload["has_sheet"] = (out_dir_abs / "sheet.jpg").exists()
                 payload["has_video"] = (out_dir_abs / "video.mp4").exists()
+                teardown = out_dir_abs / "teardown.md"
+                payload["has_teardown"] = teardown.exists()
+                if teardown.exists():
+                    payload["teardown"] = teardown.read_text(encoding="utf-8")
             self._send_json(payload)
             return
 
@@ -314,12 +454,16 @@ class Handler(BaseHTTPRequestHandler):
             dest = REPO_ROOT / out_dir_rel / "video.mp4"
             read_body_to_file(self.rfile, length, dest)
 
+            asr_model = pick_asr_model(self.headers.get("X-Asr-Model"))
+
             job_id = slug
             with JOBS_LOCK:
                 JOBS[job_id] = new_job(out_dir_hint=out_dir_rel)
+            args = ["--skip-download", "-o", out_dir_rel, "--sheet",
+                    "--model", asr_model]
             threading.Thread(
                 target=run_pipeline,
-                args=(job_id, ["--skip-download", "-o", out_dir_rel, "--sheet"], out_dir_rel),
+                args=(job_id, args, out_dir_rel),
                 daemon=True,
             ).start()
             self._send_json({"job_id": job_id, "out_dir": out_dir_rel})
@@ -331,13 +475,16 @@ class Handler(BaseHTTPRequestHandler):
             if not url:
                 self._send_json({"error": "missing url"}, 400)
                 return
+            asr_model = pick_asr_model(data.get("asr_model"))
+
             job_id = f"job_{int(time.time() * 1000)}"
             with JOBS_LOCK:
                 JOBS[job_id] = new_job()
                 JOBS[job_id]["link"] = url
+            args = [url, "--sheet", "--model", asr_model]
             threading.Thread(
                 target=run_pipeline,
-                args=(job_id, [url, "--sheet"], None),
+                args=(job_id, args, None),
                 daemon=True,
             ).start()
             self._send_json({"job_id": job_id})
@@ -386,6 +533,33 @@ class Handler(BaseHTTPRequestHandler):
             dest = REPO_ROOT / job["out_dir"] / "teardown.md"
             dest.write_text(text, encoding="utf-8")
             self._send_json({"ok": True, "path": f"{job['out_dir']}/teardown.md"})
+            return
+
+        if path == "/analyze":
+            data = self._read_json_body()
+            job = self._job_or_404(data.get("job_id", ""))
+            if job is None:
+                return
+            if job["state"] != "done":
+                self._send_json({"error": "the pipeline hasn't finished yet"}, 409)
+                return
+            if not CLAUDE_BIN:
+                self._send_json(
+                    {"error": "the `claude` command isn't installed on this machine"},
+                    409,
+                )
+                return
+            if job["analysis_state"] == "running":
+                self._send_json({"error": "an analysis is already running"}, 409)
+                return
+
+            model = pick_claude_model(data.get("model"))
+            threading.Thread(
+                target=run_analysis,
+                args=(data.get("job_id"), model),
+                daemon=True,
+            ).start()
+            self._send_json({"ok": True, "model": model})
             return
 
         if path == "/open":

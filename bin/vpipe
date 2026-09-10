@@ -253,7 +253,15 @@ fi
 
 log "Done → $out_dir"
 if [[ $DRY_RUN == 0 ]]; then
-  find "$out_dir" -maxdepth 1 -type f -printf '  %f\n' 2>/dev/null | sort
-  [[ -d $frames_dir ]] \
-    && printf '  frames/ (%s images)\n' "$(find "$frames_dir" -name '*.jpg' | wc -l | tr -d ' ')"
+  # A glob rather than `find -printf`: -printf is GNU findutils only, and BSD
+  # find (macOS) rejects it. Under `set -euo pipefail` that failure became the
+  # script's exit status — so every run on a Mac reported failure here, after
+  # the transcript, frames and sheet had all been written successfully.
+  for f in "$out_dir"/*; do
+    if [[ -f $f ]]; then printf '  %s\n' "${f##*/}"; fi
+  done | sort
+  if [[ -d $frames_dir ]]; then
+    printf '  frames/ (%s images)\n' \
+      "$(find "$frames_dir" -name '*.jpg' | wc -l | tr -d ' ')"
+  fi
 fi

@@ -20,6 +20,18 @@ pip install sherpa-onnx
 On Debian/Ubuntu: `sudo apt install ffmpeg && pip install yt-dlp sherpa-onnx`.
 On Windows: `winget install yt-dlp.yt-dlp Gyan.FFmpeg && pip install sherpa-onnx`.
 
+No Homebrew, or no admin password? ffmpeg can come from pip instead — same
+binaries, installed under your home directory:
+
+```bash
+pip install static-ffmpeg sherpa-onnx
+static_ffmpeg_paths                       # downloads ffmpeg + ffprobe, prints where
+```
+
+Then symlink the two it prints onto your PATH, e.g. into `~/.local/bin`. This
+covers everything except `yt-dlp`, which is only needed to fetch a video from a
+URL — uploading a file you already have works without it.
+
 `sherpa-onnx` runs Whisper through onnxruntime instead of torch — about 30MB
 installed rather than 2.5GB, and the weights come from GitHub releases. Models
 download on first use into `~/.cache/vpipe-models`.
@@ -149,16 +161,43 @@ Claude Code, `bin/vpipe-app` runs the same pipeline behind a local page:
 Opens `http://127.0.0.1:8765`. Drop a video (or paste a URL — TikTok isn't
 blocked on a normal home network the way it can be in a sandboxed session),
 and it downloads, transcribes, extracts frames, and builds a `sheet.jpg`
-automatically. The page shows the transcript and frames, lets you drop in
-comment screenshots and fill in a link/stats, then assembles the filled-in
-`prompts/03-ad-teardown.md` prompt and copies it to your clipboard — paste it
-into whichever chat you're logged into. Paste the model's report back into
-the page and it saves as `teardown.md` next to the video.
+automatically. The page shows the transcript and frames, and lets you drop in
+comment screenshots and fill in a link/stats.
 
-No API keys, nothing billed per video — it stops at "prompt ready to paste"
-and leans on the subscription you're already paying for. Stdlib Python only
+On first load the page asks the server what this machine actually has, and
+says so up front if `ffmpeg`, `yt-dlp` or `claude` is missing — rather than
+letting the run get most of the way through and then fail.
+
+**Two models to pick, and they do different jobs.**
+
+*Transcription quality*, in step 1, is the Whisper model — the same set
+`vpipe --model` takes, from `tiny` (fastest, roughest) to `medium` (slowest,
+best on accents and noise). It has to be set before you upload, because it
+decides how the audio gets transcribed.
+
+*Model*, in step 5, is the Claude model that writes the teardown: `opus`,
+`sonnet` or `haiku`. Change it between runs freely — the pipeline output
+doesn't need redoing.
+
+**Two ways to get the teardown.** "Analyze here" runs it on this machine
+through the local `claude` command, reading the sheet and frames off disk and
+writing `teardown.md` next to the video. That needs Claude Code signed in
+once:
+
+```bash
+claude login
+```
+
+If the session has expired the page says so and points at that command rather
+than showing a subprocess error. Or open the fold in step 5 to copy the prompt
+and paste it into whichever chat you're logged into — Claude, ChatGPT,
+Gemini — then paste the report back in step 6.
+
+Either route: no API key stored anywhere, nothing billed per video, both
+leaning on a subscription you're already paying for. Stdlib Python only
 (`app/server.py`), so nothing new to install beyond what `vpipe` already
-needs. Binds to `127.0.0.1` only.
+needs. Binds to `127.0.0.1` only, and the analysis subprocess is limited to
+`Read`/`Glob` so it can open the frames but not edit the repo.
 
 ### Where the prompts came from
 
@@ -191,3 +230,7 @@ directly is strictly more information than relaying them through text.
   back from the file. They're accurate to within a frame interval.
 - Frames are samples. A 2-second gap between body frames can hide an entire
   shot — the prompts treat that as something to report, not paper over.
+- The run summary uses a shell glob rather than `find -printf`. `-printf` is
+  GNU findutils only; BSD find (macOS) rejects it, and under `set -euo
+  pipefail` that made `vpipe` exit 1 on every macOS run — after the transcript,
+  frames and sheet had all been written correctly.
