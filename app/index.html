@@ -184,6 +184,12 @@
   <div class="panel hidden" id="prompt-panel">
     <h2>5. Run the teardown</h2>
 
+    <div class="row" id="signinRow" style="margin-bottom:10px">
+      <span class="muted warn">Claude Code isn't signed in yet.</span>
+      <button id="signinBtn">Sign in to Claude</button>
+      <span class="muted" id="signinStatus"></span>
+    </div>
+
     <div class="row">
       <label class="muted" for="claudeModel">Model</label>
       <select id="claudeModel"></select>
@@ -292,11 +298,60 @@ async function loadCapabilities() {
     show('setupWarn');
   }
 
-  if (!caps.has_claude) {
-    $('analyzeBtn').disabled = true;
-    $('claudeModel').disabled = true;
-  }
+  applyAuth(caps.has_claude, caps.claude_logged_in);
 }
+
+// One place decides what the analyze controls look like, so the sign-in row
+// and the button can't disagree about whether you're signed in.
+let authReady = false;
+
+function applyAuth(hasClaude, loggedIn) {
+  const ready = hasClaude && loggedIn;
+  authReady = ready;
+  $('analyzeBtn').disabled = !ready;
+  $('claudeModel').disabled = !ready;
+  $('signinRow').classList.toggle('hidden', !hasClaude || loggedIn);
+  if (ready) hide('analyzeError');
+}
+
+// Sign-in happens in a Terminal window, so there's no callback to wait on —
+// poll until the CLI reports itself signed in, then light the button up.
+let authTimer = null;
+let authTries = 0;
+
+function watchForLogin() {
+  clearTimeout(authTimer);
+  fetch('/auth-status').then(r => r.json()).then(d => {
+    if (d.claude_logged_in) {
+      applyAuth(true, true);
+      $('signinStatus').textContent = '';
+      $('analyzeStatus').textContent = 'signed in — ready to analyze';
+      return;
+    }
+    if (++authTries > 150) {   // ~5 minutes, then stop nagging the CLI
+      $('signinStatus').textContent = 'still not signed in — press Sign in again when ready';
+      return;
+    }
+    authTimer = setTimeout(watchForLogin, 2000);
+  });
+}
+
+$('signinBtn').addEventListener('click', () => {
+  $('signinStatus').textContent = 'opening Terminal — finish signing in there…';
+  fetch('/login', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ backend: 'claude' }),
+  }).then(r => r.json()).then(d => {
+    if (d.error) {
+      $('signinStatus').textContent = d.error;
+      return;
+    }
+    authTries = 0;
+    watchForLogin();
+  });
+});
+
 loadCapabilities();
 
 function setPill(state) {
@@ -364,17 +419,23 @@ function renderAnalysis(data) {
     hide('analyzeError');
   } else if (state === 'done') {
     status.textContent = 'saved to ' + outDir + '/teardown.md';
-    $('analyzeBtn').disabled = false;
+    $('analyzeBtn').disabled = !authReady;
     $('analyzeBtn').textContent = 'Run again';
     hide('analyzeError');
   } else if (state === 'error') {
     status.textContent = '';
-    $('analyzeBtn').disabled = false;
+    $('analyzeBtn').disabled = !authReady;
     $('analyzeError').textContent = data.analysis_error || 'analysis failed';
     show('analyzeError');
+    // A session can expire between page load and pressing Analyze, so an auth
+    // failure has to be able to bring the sign-in row back on its own.
+    if (/signed in/i.test(data.analysis_error || '')) {
+      applyAuth(true, false);
+      show('analyzeError');
+    }
   } else {
     status.textContent = '';
-    $('analyzeBtn').disabled = false;
+    $('analyzeBtn').disabled = !authReady;
   }
 
   if (data.teardown) {
@@ -410,7 +471,7 @@ $('analyzeBtn').addEventListener('click', () => {
       $('analyzeStatus').textContent = '';
       $('analyzeError').textContent = data.error;
       show('analyzeError');
-      $('analyzeBtn').disabled = false;
+      $('analyzeBtn').disabled = !authReady;
       return;
     }
     pollAnalysis();

@@ -66,6 +66,27 @@ DEFAULT_CLAUDE_MODEL = "opus"
 CLAUDE_BIN = shutil.which("claude")
 AUTH_RE = re.compile(r"authenticat|oauth|login|credential", re.I)
 
+
+def claude_logged_in() -> bool:
+    """Ask the CLI whether it's signed in.
+
+    `auth status` is a local credential check — no request to the model, so
+    this is free and fast enough to call on every page load. Anything
+    unexpected counts as "not signed in": the cost of a false negative is an
+    extra Sign in button, the cost of a false positive is a confusing failure
+    several minutes into a run.
+    """
+    if not CLAUDE_BIN:
+        return False
+    try:
+        proc = subprocess.run(
+            [CLAUDE_BIN, "auth", "status", "--json"],
+            capture_output=True, text=True, timeout=20,
+        )
+        return json.loads(proc.stdout).get("loggedIn") is True
+    except Exception:  # noqa: BLE001 - missing, slow, or unparseable all mean "no"
+        return False
+
 # job_id -> {state, step, log, out_dir, error, link, notes, screenshots}
 JOBS: dict[str, dict] = {}
 JOBS_LOCK = threading.Lock()
@@ -75,6 +96,37 @@ def slugify(filename: str) -> str:
     stem = re.sub(r"\.[^.]+$", "", filename)
     slug = re.sub(r"[^a-zA-Z0-9]+", "_", stem).strip("_").lower()
     return slug or "video"
+
+
+def open_terminal(command: str) -> bool:
+    """Open a terminal window running `command`.
+
+    Sign-in is an OAuth flow: it wants a real terminal and a browser, and the
+    password is typed into Anthropic's page, never into this app. So the app's
+    whole job here is to put that terminal one click away — it never sees or
+    handles a credential.
+
+    `command` is always one of the fixed constants below, never anything that
+    came in over the wire.
+    """
+    if sys.platform == "darwin":
+        subprocess.Popen([
+            "osascript",
+            "-e", f'tell application "Terminal" to do script "{command}"',
+            "-e", 'tell application "Terminal" to activate',
+        ])
+        return True
+
+    for term, args in (
+        ("x-terminal-emulator", ["-e"]),
+        ("gnome-terminal", ["--"]),
+        ("konsole", ["-e"]),
+        ("xterm", ["-e"]),
+    ):
+        if shutil.which(term):
+            subprocess.Popen([term, *args, "bash", "-lc", f"{command}; exec bash"])
+            return True
+    return False
 
 
 def pick_asr_model(value: str | None) -> str:
@@ -387,6 +439,7 @@ class Handler(BaseHTTPRequestHandler):
                 "claude_models": CLAUDE_MODELS,
                 "default_claude_model": DEFAULT_CLAUDE_MODEL,
                 "has_claude": bool(CLAUDE_BIN),
+                "claude_logged_in": claude_logged_in(),
                 "has_ffmpeg": bool(shutil.which("ffmpeg")),
                 "has_ytdlp": bool(shutil.which("yt-dlp")),
             })
@@ -533,6 +586,30 @@ class Handler(BaseHTTPRequestHandler):
             dest = REPO_ROOT / job["out_dir"] / "teardown.md"
             dest.write_text(text, encoding="utf-8")
             self._send_json({"ok": True, "path": f"{job['out_dir']}/teardown.md"})
+            return
+
+        if path == "/login":
+            data = self._read_json_body()
+            backend = (data.get("backend") or "claude").strip()
+            if backend != "claude":
+                self._send_json({"error": f"unknown backend: {backend}"}, 400)
+                return
+            if not CLAUDE_BIN:
+                self._send_json({"error": "the `claude` command isn't installed"}, 409)
+                return
+            # --claudeai is explicit so this signs in to the subscription
+            # rather than to Console, which bills per request.
+            opened = open_terminal("claude auth login --claudeai")
+            if not opened:
+                self._send_json({
+                    "error": "couldn't open a terminal — run `claude auth login` yourself",
+                }, 500)
+                return
+            self._send_json({"ok": True})
+            return
+
+        if path == "/auth-status":
+            self._send_json({"claude_logged_in": claude_logged_in()})
             return
 
         if path == "/analyze":

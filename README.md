@@ -181,15 +181,24 @@ doesn't need redoing.
 
 **Two ways to get the teardown.** "Analyze here" runs it on this machine
 through the local `claude` command, reading the sheet and frames off disk and
-writing `teardown.md` next to the video. That needs Claude Code signed in
-once:
+writing `teardown.md` next to the video.
+
+That needs Claude Code signed in. The page checks on load — `claude auth
+status` is a local credential check, so it costs nothing — and if you're
+signed out it shows a **Sign in to Claude** button instead of letting you
+start a run that would fail. Pressing it opens a Terminal running:
 
 ```bash
-claude login
+claude auth login --claudeai
 ```
 
-If the session has expired the page says so and points at that command rather
-than showing a subprocess error. Or open the fold in step 5 to copy the prompt
+You finish the OAuth in your browser; the page polls until the CLI reports
+itself signed in, then enables the analyze controls. Your password is typed
+into Anthropic's own page — the app never sees or stores a credential.
+`--claudeai` is explicit so this signs in to the subscription rather than to
+Console, which bills per request.
+
+Or open the fold in step 5 to copy the prompt
 and paste it into whichever chat you're logged into — Claude, ChatGPT,
 Gemini — then paste the report back in step 6.
 
