@@ -184,22 +184,25 @@
   <div class="panel hidden" id="prompt-panel">
     <h2>5. Run the teardown</h2>
 
-    <div class="row" id="signinRow" style="margin-bottom:10px">
-      <span class="muted warn">Claude Code isn't signed in yet.</span>
-      <button id="signinBtn">Sign in to Claude</button>
-      <span class="muted" id="signinStatus"></span>
-    </div>
-
     <div class="row">
-      <label class="muted" for="claudeModel">Model</label>
+      <label class="muted" for="backendSel">Analyze with</label>
+      <select id="backendSel"></select>
+      <label class="muted" for="claudeModel">model</label>
       <select id="claudeModel"></select>
       <button id="analyzeBtn">Analyze here</button>
       <span class="muted" id="analyzeStatus"></span>
     </div>
-    <div class="muted" style="margin-top:6px">
-      Runs on this machine through the <code>claude</code> command you're
-      already signed in to. No API key, nothing billed per video. Writes
-      <code>teardown.md</code> next to the video when it's done.
+
+    <div class="row hidden" id="signinRow" style="margin-top:10px">
+      <span class="muted warn" id="signinMsg"></span>
+      <button id="signinBtn">Sign in</button>
+      <span class="muted" id="signinStatus"></span>
+    </div>
+
+    <div class="muted" style="margin-top:8px">
+      Runs on this machine through a CLI you're already signed in to — no API
+      key, nothing billed per video. Writes <code>teardown.md</code> next to
+      the video when it's done.
     </div>
     <div class="muted warn hidden" id="analyzeError" style="margin-top:8px"></div>
 
@@ -261,6 +264,12 @@ const CLAUDE_BLURB = {
 };
 
 let caps = null;
+let backends = {};       // name -> state from the server
+let authReady = false;
+
+function currentBackend() {
+  return backends[$('backendSel').value] || null;
+}
 
 async function loadCapabilities() {
   caps = await fetch('/capabilities').then(r => r.json());
@@ -278,40 +287,68 @@ async function loadCapabilities() {
   asr.addEventListener('change', updateHint);
   updateHint();
 
-  const cm = $('claudeModel');
-  cm.innerHTML = '';
-  caps.claude_models.forEach(m => {
+  // Offer whichever CLIs are actually installed, and prefer one that's
+  // already signed in so the common case needs no setup at all.
+  const sel = $('backendSel');
+  sel.innerHTML = '';
+  const installed = caps.backends.filter(b => b.installed);
+  (installed.length ? installed : caps.backends).forEach(b => {
     const o = document.createElement('option');
-    o.value = m;
-    o.textContent = m + ' — ' + (CLAUDE_BLURB[m] || '');
-    if (m === caps.default_claude_model) o.selected = true;
-    cm.appendChild(o);
+    o.value = b.name;
+    o.textContent = b.label;
+    sel.appendChild(o);
   });
+  const ready = installed.find(b => b.logged_in);
+  if (ready) sel.value = ready.name;
 
-  // Say up front what's missing, rather than letting it fail mid-pipeline.
+  applyBackends(caps.backends);
+  sel.addEventListener('change', () => { applyBackends(Object.values(backends)); });
+
   const missing = [];
   if (!caps.has_ffmpeg) missing.push('ffmpeg is not installed — nothing will run until it is');
   if (!caps.has_ytdlp) missing.push('yt-dlp is not installed — you can upload files, but pasting a URL will fail');
-  if (!caps.has_claude) missing.push('the `claude` command is not installed — use the copy-the-prompt route instead');
+  if (!caps.backends.some(b => b.installed)) {
+    missing.push('neither `claude` nor `codex` is installed — use the copy-the-prompt route instead');
+  }
   if (missing.length) {
     $('setupWarn').innerHTML = missing.map(m => '⚠ ' + m).join('<br>');
     show('setupWarn');
   }
-
-  applyAuth(caps.has_claude, caps.claude_logged_in);
 }
 
-// One place decides what the analyze controls look like, so the sign-in row
-// and the button can't disagree about whether you're signed in.
-let authReady = false;
+// One place decides what the analyze controls look like, so the sign-in row,
+// the model list and the button can't disagree about the selected backend.
+function applyBackends(list) {
+  list.forEach(b => { backends[b.name] = b; });
+  const b = currentBackend();
+  if (!b) return;
 
-function applyAuth(hasClaude, loggedIn) {
-  const ready = hasClaude && loggedIn;
-  authReady = ready;
-  $('analyzeBtn').disabled = !ready;
-  $('claudeModel').disabled = !ready;
-  $('signinRow').classList.toggle('hidden', !hasClaude || loggedIn);
-  if (ready) hide('analyzeError');
+  const model = $('claudeModel');
+  model.innerHTML = '';
+  b.models.forEach(m => {
+    const o = document.createElement('option');
+    o.value = m;
+    o.textContent = b.name === 'claude' ? m + ' — ' + (CLAUDE_BLURB[m] || '') : m;
+    if (m === b.default_model) o.selected = true;
+    model.appendChild(o);
+  });
+  // Codex takes its model from ~/.codex/config.toml, so there's nothing to
+  // choose here — showing it disabled beats pretending it's a choice.
+  model.disabled = b.name === 'codex' || !b.installed || !b.logged_in;
+
+  authReady = b.installed && b.logged_in;
+  $('analyzeBtn').disabled = !authReady;
+  $('signinRow').classList.toggle('hidden', authReady);
+
+  if (!b.installed) {
+    $('signinMsg').textContent = b.label + " isn't installed — " + b.install_hint;
+    $('signinBtn').classList.add('hidden');
+  } else if (!b.logged_in) {
+    $('signinMsg').textContent = b.label + " isn't signed in yet.";
+    $('signinBtn').textContent = 'Sign in to ' + b.label;
+    $('signinBtn').classList.remove('hidden');
+  }
+  if (authReady) hide('analyzeError');
 }
 
 // Sign-in happens in a Terminal window, so there's no callback to wait on —
@@ -322,8 +359,8 @@ let authTries = 0;
 function watchForLogin() {
   clearTimeout(authTimer);
   fetch('/auth-status').then(r => r.json()).then(d => {
-    if (d.claude_logged_in) {
-      applyAuth(true, true);
+    applyBackends(d.backends);
+    if (authReady) {
       $('signinStatus').textContent = '';
       $('analyzeStatus').textContent = 'signed in — ready to analyze';
       return;
@@ -337,11 +374,13 @@ function watchForLogin() {
 }
 
 $('signinBtn').addEventListener('click', () => {
+  const b = currentBackend();
+  if (!b) return;
   $('signinStatus').textContent = 'opening Terminal — finish signing in there…';
   fetch('/login', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ backend: 'claude' }),
+    body: JSON.stringify({ backend: b.name }),
   }).then(r => r.json()).then(d => {
     if (d.error) {
       $('signinStatus').textContent = d.error;
@@ -354,58 +393,6 @@ $('signinBtn').addEventListener('click', () => {
 
 loadCapabilities();
 
-function setPill(state) {
-  const pill = $('statePill');
-  pill.textContent = state;
-  pill.className = 'pill ' + state;
-}
-
-async function startJob(promise) {
-  show('status-panel');
-  setPill('queued');
-  $('logBox').textContent = '';
-  const data = await promise;
-  jobId = data.job_id;
-  if (data.out_dir) outDir = data.out_dir;
-  poll();
-}
-
-function pickFile() { $('fileInput').click(); }
-
-$('dropzone').addEventListener('click', pickFile);
-$('dropzone').addEventListener('dragover', (e) => { e.preventDefault(); $('dropzone').classList.add('hover'); });
-$('dropzone').addEventListener('dragleave', () => $('dropzone').classList.remove('hover'));
-$('dropzone').addEventListener('drop', (e) => {
-  e.preventDefault();
-  $('dropzone').classList.remove('hover');
-  const file = e.dataTransfer.files[0];
-  if (file) uploadFile(file);
-});
-$('fileInput').addEventListener('change', (e) => {
-  if (e.target.files[0]) uploadFile(e.target.files[0]);
-});
-
-function uploadFile(file) {
-  startJob(fetch('/upload', {
-    method: 'POST',
-    headers: {
-      'X-Filename': encodeURIComponent(file.name),
-      'X-Asr-Model': $('asrModel').value,
-    },
-    body: file,
-  }).then(r => r.json()));
-}
-
-$('urlBtn').addEventListener('click', () => {
-  const url = $('urlInput').value.trim();
-  if (!url) return;
-  startJob(fetch('/url', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ url, asr_model: $('asrModel').value }),
-  }).then(r => r.json()));
-});
-
 let analysisTimer = null;
 
 function renderAnalysis(data) {
@@ -415,6 +402,7 @@ function renderAnalysis(data) {
   if (state === 'running') {
     status.textContent = 'running ' + (data.analysis_model || '') +
       ' — reading the frames, this takes a minute or two…';
+    $('signinRow').classList.add('hidden');
     $('analyzeBtn').disabled = true;
     hide('analyzeError');
   } else if (state === 'done') {
@@ -428,10 +416,13 @@ function renderAnalysis(data) {
     $('analyzeError').textContent = data.analysis_error || 'analysis failed';
     show('analyzeError');
     // A session can expire between page load and pressing Analyze, so an auth
-    // failure has to be able to bring the sign-in row back on its own.
+    // failure has to be able to bring the sign-in row back on its own. Ask the
+    // server rather than assuming which backend dropped out.
     if (/signed in/i.test(data.analysis_error || '')) {
-      applyAuth(true, false);
-      show('analyzeError');
+      fetch('/auth-status').then(r => r.json()).then(d => {
+        applyBackends(d.backends);
+        show('analyzeError');
+      });
     }
   } else {
     status.textContent = '';
@@ -465,7 +456,11 @@ $('analyzeBtn').addEventListener('click', () => {
   fetch('/analyze', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ job_id: jobId, model: $('claudeModel').value }),
+    body: JSON.stringify({
+      job_id: jobId,
+      backend: $('backendSel').value,
+      model: $('claudeModel').value,
+    }),
   }).then(r => r.json()).then(data => {
     if (data.error) {
       $('analyzeStatus').textContent = '';

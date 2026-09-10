@@ -64,7 +64,69 @@ CLAUDE_MODELS = ["opus", "sonnet", "haiku"]
 DEFAULT_CLAUDE_MODEL = "opus"
 
 CLAUDE_BIN = shutil.which("claude")
-AUTH_RE = re.compile(r"authenticat|oauth|login|credential", re.I)
+CODEX_BIN = shutil.which("codex")
+AUTH_RE = re.compile(r"authenticat|oauth|login|credential|not logged in", re.I)
+
+CODEX_CONFIG = Path.home() / ".codex" / "config.toml"
+
+
+def codex_model() -> str:
+    """Report the model Codex is configured to use.
+
+    Deliberately read rather than chosen: Codex has no "list models" command,
+    so any dropdown here would be a guess that goes stale. `~/.codex/config.toml`
+    is the same thing Codex itself reads, and changing the model there is the
+    normal Codex way to do it.
+    """
+    try:
+        for line in CODEX_CONFIG.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if line.startswith("model") and "=" in line:
+                key, _, value = line.partition("=")
+                if key.strip() == "model":
+                    return value.strip().strip('"\'')
+    except Exception:  # noqa: BLE001 - no config, unreadable, whatever
+        pass
+    return "default"
+
+
+def codex_logged_in() -> bool:
+    """`codex login status` exits 0 and says who you're signed in as."""
+    if not CODEX_BIN:
+        return False
+    try:
+        proc = subprocess.run(
+            [CODEX_BIN, "login", "status"],
+            capture_output=True, text=True, timeout=20,
+        )
+        # Codex reports this on stderr, not stdout.
+        blob = f"{proc.stdout}{proc.stderr}".lower()
+        return proc.returncode == 0 and "logged in" in blob
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def backend_state(name: str) -> dict:
+    if name == "claude":
+        return {
+            "name": "claude",
+            "label": "Claude",
+            "installed": bool(CLAUDE_BIN),
+            "logged_in": claude_logged_in(),
+            "models": CLAUDE_MODELS,
+            "default_model": DEFAULT_CLAUDE_MODEL,
+            "install_hint": "npm install -g @anthropic-ai/claude-code",
+        }
+    return {
+        "name": "codex",
+        "label": "ChatGPT (Codex)",
+        "installed": bool(CODEX_BIN),
+        "logged_in": codex_logged_in(),
+        # Codex takes its model from its own config; see codex_model().
+        "models": [codex_model()],
+        "default_model": codex_model(),
+        "install_hint": "npm install -g --prefix ~/.local @openai/codex",
+    }
 
 
 def claude_logged_in() -> bool:
@@ -240,6 +302,7 @@ def new_job(out_dir_hint: str | None = None) -> dict:
         "analysis_state": "idle",  # idle | running | done | error
         "analysis_error": None,
         "analysis_model": "",
+        "analysis_backend": "",
     }
 
 
@@ -309,46 +372,78 @@ def build_prompt(job: dict, local: bool = False) -> str:
     return "\n".join(lines)
 
 
-def run_analysis(job_id: str, model: str) -> None:
-    """Run the teardown through the local `claude` CLI and save teardown.md.
+def analysis_command(backend: str, model: str, prompt: str, out_dir: str,
+                     result_file: Path) -> list[str]:
+    """Build the argv for one backend.
 
-    This deliberately shells out to the CLI rather than calling the API: the
-    CLI is already signed in to the user's subscription, so there's no API key
-    to store here and nothing billed per video. The cost is that an expired
-    session shows up as a subprocess error, which is why the auth case gets
-    translated into something actionable below.
+    Both are told to read the frames off disk and both are held to read-only:
+    the analysis opens images and a transcript, it has no business editing the
+    repo or running anything.
+    """
+    if backend == "claude":
+        return [
+            CLAUDE_BIN, "-p", prompt,
+            "--model", model,
+            "--allowedTools", "Read", "Glob",
+            "--permission-mode", "dontAsk",
+        ]
+
+    cmd = [
+        CODEX_BIN, "exec", prompt,
+        "--sandbox", "read-only",
+        # out/ is gitignored and the app may well be run outside a checkout.
+        "--skip-git-repo-check",
+        # Capture the final message directly instead of scraping it out of the
+        # event log, which carries reasoning and tool chatter as well.
+        "--output-last-message", str(result_file),
+    ]
+    sheet = REPO_ROOT / out_dir / "sheet.jpg"
+    if sheet.exists():
+        # Attaching beats making it shell out to find and open the file.
+        cmd += ["--image", str(sheet)]
+    if model and model != "default":
+        cmd += ["--model", model]
+    return cmd
+
+
+def run_analysis(job_id: str, backend: str, model: str) -> None:
+    """Run the teardown through a local CLI and save teardown.md.
+
+    Shelling out to a CLI rather than calling an API is the whole point: both
+    CLIs are already signed in to a subscription, so there's no API key stored
+    here and nothing billed per video. The cost is that an expired session
+    arrives as a subprocess failure, which is why that one case gets
+    translated into something you can act on.
     """
     job = JOBS[job_id]
     job["analysis_state"] = "running"
     job["analysis_error"] = None
     job["analysis_model"] = model
+    job["analysis_backend"] = backend
 
+    result_file = REPO_ROOT / job["out_dir"] / ".codex-last-message.txt"
     try:
         prompt = build_prompt(job, local=True)
+        cmd = analysis_command(backend, model, prompt, job["out_dir"], result_file)
         proc = subprocess.run(
-            [
-                CLAUDE_BIN, "-p", prompt,
-                "--model", model,
-                # Read/Glob only: it needs to open the frames and transcript,
-                # never to edit the repo or run anything.
-                "--allowedTools", "Read", "Glob",
-                "--permission-mode", "dontAsk",
-            ],
-            cwd=str(REPO_ROOT),
-            capture_output=True,
-            text=True,
-            timeout=1800,
+            cmd, cwd=str(REPO_ROOT), capture_output=True, text=True, timeout=1800,
         )
-        output = (proc.stdout or "").strip()
+
+        if backend == "codex" and result_file.exists():
+            output = result_file.read_text(encoding="utf-8").strip()
+            result_file.unlink(missing_ok=True)
+        else:
+            output = (proc.stdout or "").strip()
         stderr = (proc.stderr or "").strip()
 
         if proc.returncode != 0 or not output:
-            detail = stderr or output or f"claude exited with status {proc.returncode}"
+            detail = stderr or output or f"exited with status {proc.returncode}"
             if AUTH_RE.search(detail):
+                label = "Claude Code" if backend == "claude" else "Codex"
                 job["analysis_state"] = "error"
                 job["analysis_error"] = (
-                    "Claude Code isn't signed in. Open Terminal, run:  claude login  "
-                    "— then come back and press Analyze again."
+                    f"{label} isn't signed in. Press the Sign in button above, "
+                    "then press Analyze again."
                 )
                 return
             job["analysis_state"] = "error"
@@ -364,6 +459,8 @@ def run_analysis(job_id: str, model: str) -> None:
     except Exception as e:  # noqa: BLE001 - surface it, don't swallow it
         job["analysis_state"] = "error"
         job["analysis_error"] = str(e)
+    finally:
+        result_file.unlink(missing_ok=True)
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -436,10 +533,7 @@ class Handler(BaseHTTPRequestHandler):
             self._send_json({
                 "asr_models": ASR_MODELS,
                 "default_asr_model": DEFAULT_ASR_MODEL,
-                "claude_models": CLAUDE_MODELS,
-                "default_claude_model": DEFAULT_CLAUDE_MODEL,
-                "has_claude": bool(CLAUDE_BIN),
-                "claude_logged_in": claude_logged_in(),
+                "backends": [backend_state("claude"), backend_state("codex")],
                 "has_ffmpeg": bool(shutil.which("ffmpeg")),
                 "has_ytdlp": bool(shutil.which("yt-dlp")),
             })
@@ -461,6 +555,7 @@ class Handler(BaseHTTPRequestHandler):
                 "analysis_state": job["analysis_state"],
                 "analysis_error": job["analysis_error"],
                 "analysis_model": job["analysis_model"],
+                "analysis_backend": job["analysis_backend"],
             }
             if job["out_dir"]:
                 payload["out_dir"] = job["out_dir"]
@@ -591,25 +686,36 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/login":
             data = self._read_json_body()
             backend = (data.get("backend") or "claude").strip()
-            if backend != "claude":
+            if backend not in ("claude", "codex"):
                 self._send_json({"error": f"unknown backend: {backend}"}, 400)
                 return
-            if not CLAUDE_BIN:
-                self._send_json({"error": "the `claude` command isn't installed"}, 409)
+
+            state = backend_state(backend)
+            if not state["installed"]:
+                self._send_json(
+                    {"error": f"{state['label']} isn't installed — {state['install_hint']}"},
+                    409,
+                )
                 return
+
             # --claudeai is explicit so this signs in to the subscription
-            # rather than to Console, which bills per request.
-            opened = open_terminal("claude auth login --claudeai")
-            if not opened:
-                self._send_json({
-                    "error": "couldn't open a terminal — run `claude auth login` yourself",
-                }, 500)
+            # rather than to Console, which bills per request. Codex's own
+            # login defaults to Sign in with ChatGPT.
+            command = (
+                "claude auth login --claudeai" if backend == "claude" else "codex login"
+            )
+            if not open_terminal(command):
+                self._send_json(
+                    {"error": f"couldn't open a terminal — run `{command}` yourself"}, 500
+                )
                 return
             self._send_json({"ok": True})
             return
 
         if path == "/auth-status":
-            self._send_json({"claude_logged_in": claude_logged_in()})
+            self._send_json({
+                "backends": [backend_state("claude"), backend_state("codex")],
+            })
             return
 
         if path == "/analyze":
@@ -620,9 +726,21 @@ class Handler(BaseHTTPRequestHandler):
             if job["state"] != "done":
                 self._send_json({"error": "the pipeline hasn't finished yet"}, 409)
                 return
-            if not CLAUDE_BIN:
+            backend = (data.get("backend") or "claude").strip()
+            if backend not in ("claude", "codex"):
+                self._send_json({"error": f"unknown backend: {backend}"}, 400)
+                return
+
+            state = backend_state(backend)
+            if not state["installed"]:
                 self._send_json(
-                    {"error": "the `claude` command isn't installed on this machine"},
+                    {"error": f"{state['label']} isn't installed — {state['install_hint']}"},
+                    409,
+                )
+                return
+            if not state["logged_in"]:
+                self._send_json(
+                    {"error": f"{state['label']} isn't signed in — press Sign in first"},
                     409,
                 )
                 return
@@ -630,13 +748,18 @@ class Handler(BaseHTTPRequestHandler):
                 self._send_json({"error": "an analysis is already running"}, 409)
                 return
 
-            model = pick_claude_model(data.get("model"))
+            requested = data.get("model")
+            if backend == "claude":
+                model = pick_claude_model(requested)
+            else:
+                model = state["default_model"]
+
             threading.Thread(
                 target=run_analysis,
-                args=(data.get("job_id"), model),
+                args=(data.get("job_id"), backend, model),
                 daemon=True,
             ).start()
-            self._send_json({"ok": True, "model": model})
+            self._send_json({"ok": True, "backend": backend, "model": model})
             return
 
         if path == "/open":

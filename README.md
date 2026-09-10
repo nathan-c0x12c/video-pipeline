@@ -175,38 +175,59 @@ letting the run get most of the way through and then fail.
 best on accents and noise). It has to be set before you upload, because it
 decides how the audio gets transcribed.
 
-*Model*, in step 5, is the Claude model that writes the teardown: `opus`,
-`sonnet` or `haiku`. Change it between runs freely — the pipeline output
-doesn't need redoing.
+*Analyze with*, in step 5, is the model that writes the teardown. Two
+backends, both shelling out to a CLI that's already signed in to a
+subscription:
 
-**Two ways to get the teardown.** "Analyze here" runs it on this machine
-through the local `claude` command, reading the sheet and frames off disk and
-writing `teardown.md` next to the video.
+| Backend | CLI | Model |
+| --- | --- | --- |
+| Claude | `claude` | `opus` / `sonnet` / `haiku`, picked in the page |
+| ChatGPT (Codex) | `codex` | whatever `~/.codex/config.toml` says |
 
-That needs Claude Code signed in. The page checks on load — `claude auth
-status` is a local credential check, so it costs nothing — and if you're
-signed out it shows a **Sign in to Claude** button instead of letting you
-start a run that would fail. Pressing it opens a Terminal running:
+Codex has no "list models" command, so the page reads the model out of your
+Codex config and shows it rather than offering a dropdown that would go stale
+— change it there, the Codex way. Claude's aliases resolve to the current
+model, so that list doesn't go stale either.
+
+Install whichever you want:
 
 ```bash
-claude auth login --claudeai
+npm install -g @anthropic-ai/claude-code
+npm install -g --prefix ~/.local @openai/codex   # --prefix avoids needing sudo
 ```
 
-You finish the OAuth in your browser; the page polls until the CLI reports
-itself signed in, then enables the analyze controls. Your password is typed
-into Anthropic's own page — the app never sees or stores a credential.
-`--claudeai` is explicit so this signs in to the subscription rather than to
-Console, which bills per request.
+The page offers only the ones actually installed, and defaults to one that's
+already signed in, so the common case needs no setup.
 
-Or open the fold in step 5 to copy the prompt
-and paste it into whichever chat you're logged into — Claude, ChatGPT,
+**Signing in.** The page checks on load — `claude auth status` and `codex
+login status` are local credential checks, so they cost nothing — and if the
+selected backend is signed out it shows a **Sign in** button instead of
+letting you start a run that would fail. Pressing it opens a Terminal
+running:
+
+```bash
+claude auth login --claudeai   # or: codex login
+```
+
+You finish in your browser; the page polls until the CLI reports itself
+signed in, then enables the analyze controls. Your password is typed into
+Anthropic's or OpenAI's own page — the app never sees or stores a credential.
+`--claudeai` is explicit so this signs in to the subscription rather than to
+Console, which bills per request; `codex login` defaults to Sign in with
+ChatGPT.
+
+**Getting the teardown.** "Analyze here" runs it on this machine, reading the
+sheet and frames off disk — Codex gets the sheet attached with `--image`,
+Claude opens it with `Read` — and writes `teardown.md` next to the video.
+Both run read-only, so the analysis can open images and the transcript but
+can't edit the repo or run anything. Or open the fold in step 5 to copy the
+prompt and paste it into whichever chat you're logged into — Claude, ChatGPT,
 Gemini — then paste the report back in step 6.
 
 Either route: no API key stored anywhere, nothing billed per video, both
 leaning on a subscription you're already paying for. Stdlib Python only
 (`app/server.py`), so nothing new to install beyond what `vpipe` already
-needs. Binds to `127.0.0.1` only, and the analysis subprocess is limited to
-`Read`/`Glob` so it can open the frames but not edit the repo.
+needs. Binds to `127.0.0.1` only.
 
 ### Where the prompts came from
 
