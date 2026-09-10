@@ -1,0 +1,19 @@
+#!/usr/bin/env bash
+#
+# vpipe-app — launch the local teardown page.
+#
+# Runs entirely on this machine: no API keys, no cloud session. Point it at
+# a video (upload or URL), it runs the same vpipe pipeline, and hands you a
+# filled-in prompt to paste into whichever chat you're logged into.
+
+set -euo pipefail
+
+script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+repo_root=$(cd -- "$script_dir/.." && pwd)
+
+command -v python3 >/dev/null 2>&1 || {
+  echo "vpipe-app: python3 not found. See the README for install instructions." >&2
+  exit 1
+}
+
+exec python3 "$repo_root/app/server.py" "$@"

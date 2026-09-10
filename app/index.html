@@ -1,0 +1,383 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>vpipe teardown</title>
+<style>
+  :root {
+    color-scheme: light dark;
+    --bg: #0e0f12;
+    --panel: #17181c;
+    --border: #2a2c33;
+    --text: #e7e7ea;
+    --muted: #9a9ba3;
+    --accent: #5b8cff;
+    --ok: #4ade80;
+    --err: #f87171;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    font: 14px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    background: var(--bg);
+    color: var(--text);
+    padding: 24px;
+  }
+  h1 { font-size: 18px; margin: 0 0 16px; }
+  h2 { font-size: 14px; text-transform: uppercase; letter-spacing: .04em; color: var(--muted); margin: 0 0 8px; }
+  .wrap { max-width: 880px; margin: 0 auto; display: flex; flex-direction: column; gap: 20px; }
+  .panel { background: var(--panel); border: 1px solid var(--border); border-radius: 10px; padding: 16px; }
+  .drop {
+    border: 2px dashed var(--border);
+    border-radius: 10px;
+    padding: 32px;
+    text-align: center;
+    color: var(--muted);
+    cursor: pointer;
+    transition: border-color .15s;
+  }
+  .drop.hover { border-color: var(--accent); color: var(--text); }
+  .row { display: flex; gap: 8px; align-items: center; }
+  .row input[type=text] {
+    flex: 1;
+    background: #0000;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    color: var(--text);
+    padding: 8px 10px;
+    font-size: 13px;
+  }
+  textarea {
+    width: 100%;
+    background: #0000;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    color: var(--text);
+    padding: 8px 10px;
+    font: 12px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace;
+    resize: vertical;
+  }
+  button {
+    background: var(--accent);
+    color: #fff;
+    border: none;
+    border-radius: 6px;
+    padding: 8px 14px;
+    font-size: 13px;
+    cursor: pointer;
+  }
+  button.secondary { background: #2a2c33; color: var(--text); }
+  button:disabled { opacity: .4; cursor: default; }
+  .pill {
+    display: inline-block;
+    font-size: 11px;
+    padding: 2px 8px;
+    border-radius: 999px;
+    background: #2a2c33;
+    color: var(--muted);
+  }
+  .pill.running { color: var(--accent); }
+  .pill.done { color: var(--ok); }
+  .pill.error { color: var(--err); }
+  pre.log {
+    background: #000;
+    border-radius: 6px;
+    padding: 10px;
+    max-height: 140px;
+    overflow: auto;
+    font: 11px/1.4 ui-monospace, monospace;
+    color: var(--muted);
+    white-space: pre-wrap;
+  }
+  pre.transcript {
+    max-height: 260px;
+    overflow: auto;
+    font: 12px/1.6 ui-monospace, monospace;
+    white-space: pre-wrap;
+    background: #000;
+    border-radius: 6px;
+    padding: 10px;
+  }
+  img.sheet { max-width: 100%; border-radius: 8px; border: 1px solid var(--border); }
+  .frames { display: flex; gap: 6px; overflow-x: auto; padding: 4px 0; }
+  .frames img { height: 90px; border-radius: 4px; border: 1px solid var(--border); flex: none; }
+  .hidden { display: none !important; }
+  .links a {
+    display: inline-block;
+    margin-right: 8px;
+    padding: 6px 12px;
+    border-radius: 6px;
+    background: #2a2c33;
+    color: var(--text);
+    text-decoration: none;
+    font-size: 13px;
+  }
+  .muted { color: var(--muted); font-size: 12px; }
+  .screenshot-list { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; }
+  .screenshot-list span { background: #2a2c33; border-radius: 4px; padding: 3px 8px; font-size: 11px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>vpipe teardown</h1>
+
+  <div class="panel" id="intake">
+    <h2>1. Get a video in</h2>
+    <div class="drop" id="dropzone">Drop a video file here, or click to choose one</div>
+    <input type="file" id="fileInput" accept="video/*" class="hidden">
+    <div class="row" style="margin-top:10px">
+      <input type="text" id="urlInput" placeholder="or paste a TikTok / IG / YouTube Shorts URL">
+      <button id="urlBtn">Fetch</button>
+    </div>
+  </div>
+
+  <div class="panel hidden" id="status-panel">
+    <h2>2. Processing</h2>
+    <div class="row">
+      <span class="pill" id="statePill">queued</span>
+      <span class="muted" id="stepText"></span>
+    </div>
+    <pre class="log" id="logBox"></pre>
+  </div>
+
+  <div class="panel hidden" id="result-panel">
+    <h2>3. Review</h2>
+    <img class="sheet hidden" id="sheetImg">
+    <div class="frames" id="frameStrip"></div>
+    <pre class="transcript" id="transcriptBox"></pre>
+  </div>
+
+  <div class="panel hidden" id="meta-panel">
+    <h2>4. Details (optional, feeds the prompt)</h2>
+    <div class="row">
+      <input type="text" id="linkInput" placeholder="link (if not already filled from the URL)">
+    </div>
+    <div style="margin-top:8px">
+      <textarea id="notesInput" rows="3" placeholder="views / likes / comments / shares, or any other notes to include"></textarea>
+    </div>
+    <div class="row" style="margin-top:8px">
+      <button class="secondary" id="saveMetaBtn">Save details</button>
+    </div>
+    <div style="margin-top:12px">
+      <div class="muted">Drop comment screenshots here — they get saved next to the video</div>
+      <div class="drop" id="shotDrop" style="padding:16px;margin-top:6px">drop screenshots</div>
+      <input type="file" id="shotInput" accept="image/*" multiple class="hidden">
+      <div class="screenshot-list" id="shotList"></div>
+    </div>
+  </div>
+
+  <div class="panel hidden" id="prompt-panel">
+    <h2>5. Send it to a model</h2>
+    <div class="row">
+      <button id="copyBtn">Copy prompt</button>
+      <button class="secondary" id="openFolderBtn">Open folder</button>
+      <span class="muted" id="copyStatus"></span>
+    </div>
+    <div class="links" style="margin-top:10px">
+      <a href="https://claude.ai/new" target="_blank">Open Claude</a>
+      <a href="https://chatgpt.com/" target="_blank">Open ChatGPT</a>
+      <a href="https://gemini.google.com/app" target="_blank">Open Gemini</a>
+    </div>
+    <textarea id="promptBox" rows="10" readonly style="margin-top:10px" placeholder="Click Copy prompt to generate it"></textarea>
+  </div>
+
+  <div class="panel hidden" id="report-panel">
+    <h2>6. Paste the report back</h2>
+    <textarea id="reportInput" rows="12" placeholder="Paste the model's teardown here"></textarea>
+    <div class="row" style="margin-top:8px">
+      <button id="saveReportBtn">Save as teardown.md</button>
+      <span class="muted" id="reportStatus"></span>
+    </div>
+  </div>
+</div>
+
+<script>
+let jobId = null;
+let outDir = null;
+let pollTimer = null;
+
+const $ = (id) => document.getElementById(id);
+const show = (id) => $(id).classList.remove('hidden');
+
+function setPill(state) {
+  const pill = $('statePill');
+  pill.textContent = state;
+  pill.className = 'pill ' + state;
+}
+
+async function startJob(promise) {
+  show('status-panel');
+  setPill('queued');
+  $('logBox').textContent = '';
+  const data = await promise;
+  jobId = data.job_id;
+  if (data.out_dir) outDir = data.out_dir;
+  poll();
+}
+
+function pickFile() { $('fileInput').click(); }
+
+$('dropzone').addEventListener('click', pickFile);
+$('dropzone').addEventListener('dragover', (e) => { e.preventDefault(); $('dropzone').classList.add('hover'); });
+$('dropzone').addEventListener('dragleave', () => $('dropzone').classList.remove('hover'));
+$('dropzone').addEventListener('drop', (e) => {
+  e.preventDefault();
+  $('dropzone').classList.remove('hover');
+  const file = e.dataTransfer.files[0];
+  if (file) uploadFile(file);
+});
+$('fileInput').addEventListener('change', (e) => {
+  if (e.target.files[0]) uploadFile(e.target.files[0]);
+});
+
+function uploadFile(file) {
+  startJob(fetch('/upload', {
+    method: 'POST',
+    headers: { 'X-Filename': encodeURIComponent(file.name) },
+    body: file,
+  }).then(r => r.json()));
+}
+
+$('urlBtn').addEventListener('click', () => {
+  const url = $('urlInput').value.trim();
+  if (!url) return;
+  startJob(fetch('/url', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ url }),
+  }).then(r => r.json()));
+});
+
+function poll() {
+  clearTimeout(pollTimer);
+  fetch('/status/' + encodeURIComponent(jobId)).then(r => r.json()).then(data => {
+    setPill(data.state);
+    $('stepText').textContent = data.step || '';
+    $('logBox').textContent = data.log || '';
+    $('logBox').scrollTop = $('logBox').scrollHeight;
+    if (data.out_dir) outDir = data.out_dir;
+
+    if (data.link && !$('linkInput').value) $('linkInput').value = data.link;
+    if (data.notes) $('notesInput').value = data.notes;
+    renderScreenshots(data.screenshots || []);
+
+    if (data.state === 'done') {
+      renderResult(data);
+      show('result-panel');
+      show('meta-panel');
+      show('prompt-panel');
+      show('report-panel');
+      return;
+    }
+    if (data.state === 'error') {
+      $('logBox').textContent += '\n\nERROR: ' + data.error;
+      return;
+    }
+    pollTimer = setTimeout(poll, 1200);
+  });
+}
+
+function renderResult(data) {
+  $('transcriptBox').textContent = data.transcript || '(no speech detected)';
+  const sheetImg = $('sheetImg');
+  if (data.has_sheet) {
+    sheetImg.src = '/' + outDir + '/sheet.jpg?t=' + Date.now();
+    sheetImg.classList.remove('hidden');
+  }
+  const strip = $('frameStrip');
+  strip.innerHTML = '';
+  (data.frames || []).forEach(f => {
+    const img = document.createElement('img');
+    img.src = '/' + outDir + '/frames/' + f.file;
+    img.title = f.segment + ' ' + f.seconds + 's';
+    strip.appendChild(img);
+  });
+}
+
+function renderScreenshots(list) {
+  const box = $('shotList');
+  box.innerHTML = '';
+  list.forEach(name => {
+    const span = document.createElement('span');
+    span.textContent = name;
+    box.appendChild(span);
+  });
+}
+
+$('saveMetaBtn').addEventListener('click', () => {
+  fetch('/meta', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      job_id: jobId,
+      link: $('linkInput').value,
+      notes: $('notesInput').value,
+    }),
+  });
+});
+
+$('shotDrop').addEventListener('click', () => $('shotInput').click());
+$('shotDrop').addEventListener('dragover', (e) => { e.preventDefault(); $('shotDrop').classList.add('hover'); });
+$('shotDrop').addEventListener('dragleave', () => $('shotDrop').classList.remove('hover'));
+$('shotDrop').addEventListener('drop', (e) => {
+  e.preventDefault();
+  $('shotDrop').classList.remove('hover');
+  [...e.dataTransfer.files].forEach(uploadScreenshot);
+});
+$('shotInput').addEventListener('change', (e) => {
+  [...e.target.files].forEach(uploadScreenshot);
+});
+
+function uploadScreenshot(file) {
+  fetch('/screenshot', {
+    method: 'POST',
+    headers: { 'X-Job-Id': jobId, 'X-Filename': encodeURIComponent(file.name) },
+    body: file,
+  }).then(r => r.json()).then(data => {
+    if (data.ok) {
+      const span = document.createElement('span');
+      span.textContent = file.name;
+      $('shotList').appendChild(span);
+    }
+  });
+}
+
+$('copyBtn').addEventListener('click', async () => {
+  // Push whatever's in the details panel first, so the prompt reflects it.
+  await fetch('/meta', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ job_id: jobId, link: $('linkInput').value, notes: $('notesInput').value }),
+  });
+  const text = await fetch('/prompt/' + encodeURIComponent(jobId)).then(r => r.text());
+  $('promptBox').value = text;
+  try {
+    await navigator.clipboard.writeText(text);
+    $('copyStatus').textContent = 'Copied — paste it into your chat of choice.';
+  } catch {
+    $('copyStatus').textContent = 'Could not use the clipboard — select the text below and copy manually.';
+  }
+});
+
+$('openFolderBtn').addEventListener('click', () => {
+  fetch('/open', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ job_id: jobId }),
+  }).then(r => r.json()).then(data => {
+    if (!data.ok) $('copyStatus').textContent = 'Could not open a file browser automatically — folder: ' + data.path;
+  });
+});
+
+$('saveReportBtn').addEventListener('click', () => {
+  fetch('/report', {
+    method: 'POST',
+    headers: { 'X-Job-Id': jobId },
+    body: $('reportInput').value,
+  }).then(r => r.json()).then(data => {
+    $('reportStatus').textContent = data.ok ? ('Saved to ' + data.path) : 'Could not save';
+  });
+});
+</script>
+</body>
+</html>

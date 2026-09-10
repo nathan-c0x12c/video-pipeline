@@ -51,6 +51,7 @@ vpipe <url> [options]
 | `--skip-download` | | Reuse a `video.mp4` that's already there |
 | `--skip-transcript` | | Don't run whisper |
 | `--skip-frames` | | Don't extract frames |
+| `--sheet` | | Also compose `frames/` into one labelled `sheet.jpg` |
 | `-n, --dry-run` | | Print the commands instead of running them |
 
 ### Output
@@ -60,12 +61,30 @@ out/<video-id>/
 ├── video.mp4
 ├── video.info.json     # caption, author, view/like counts, duration
 ├── video.txt           # transcript, one timestamped line per speech segment
+├── sheet.jpg           # only with --sheet: every frame tiled into one image
 └── frames/
     ├── index.tsv       # frame → approximate timestamp, for aligning to the transcript
     ├── hook_001.jpg    # first 5s @ 2fps  → 10 frames
     ├── ...
     └── body_001.jpg    # the rest @ 0.5fps → 1 frame / 2s
 ```
+
+### Contact sheets
+
+`bin/vsheet OUT_DIR` tiles a video's frames into one labelled image — each
+tile gets its timestamp burned into the corner (`H 0:02`, `B 0:15`). It's what
+`vpipe --sheet` calls internally, but it also runs standalone against any
+output directory that already has `frames/index.tsv`:
+
+```bash
+vsheet out/123                       # → out/123/sheet.jpg, 3 columns
+vsheet out/123 --cols 4 --no-labels  # wider grid, no timestamps
+```
+
+One sheet is far cheaper to hand a model than a dozen separate frames, and
+still legible enough for hook text and on-screen UI. Pull an individual
+full-resolution frame from `frames/` instead when a detail needs a closer
+look than the sheet gives it.
 
 ### Examples
 
@@ -117,6 +136,29 @@ want a record of what happens.
 `frames/index.tsv` maps each frame to its timestamp, which is what lets Claude
 line frames up against the transcript. Without it, frame filenames carry no
 timing.
+
+### Local app
+
+If you'd rather work from a Claude / ChatGPT / Gemini subscription than
+Claude Code, `bin/vpipe-app` runs the same pipeline behind a local page:
+
+```bash
+./bin/vpipe-app
+```
+
+Opens `http://127.0.0.1:8765`. Drop a video (or paste a URL — TikTok isn't
+blocked on a normal home network the way it can be in a sandboxed session),
+and it downloads, transcribes, extracts frames, and builds a `sheet.jpg`
+automatically. The page shows the transcript and frames, lets you drop in
+comment screenshots and fill in a link/stats, then assembles the filled-in
+`prompts/03-ad-teardown.md` prompt and copies it to your clipboard — paste it
+into whichever chat you're logged into. Paste the model's report back into
+the page and it saves as `teardown.md` next to the video.
+
+No API keys, nothing billed per video — it stops at "prompt ready to paste"
+and leans on the subscription you're already paying for. Stdlib Python only
+(`app/server.py`), so nothing new to install beyond what `vpipe` already
+needs. Binds to `127.0.0.1` only.
 
 ### Where the prompts came from
 

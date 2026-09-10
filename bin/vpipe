@@ -36,6 +36,7 @@ Options:
       --skip-download    Reuse video.mp4 already in the output directory
       --skip-transcript  Don't run whisper
       --skip-frames      Don't extract frames
+      --sheet            Also compose frames/ into one labelled sheet.jpg
   -n, --dry-run          Print the commands instead of running them
   -h, --help             Show this message
 
@@ -99,6 +100,7 @@ body_fps=$DEFAULT_BODY_FPS
 skip_download=0
 skip_transcript=0
 skip_frames=0
+sheet=0
 DRY_RUN=0
 
 while [[ $# -gt 0 ]]; do
@@ -112,6 +114,7 @@ while [[ $# -gt 0 ]]; do
     --skip-download)  skip_download=1; shift ;;
     --skip-transcript) skip_transcript=1; shift ;;
     --skip-frames)    skip_frames=1; shift ;;
+    --sheet)          sheet=1; shift ;;
     -n|--dry-run)     DRY_RUN=1; shift ;;
     -h|--help)        usage; exit 0 ;;
     -*)               die "unknown option: $1 (try --help)" ;;
@@ -236,6 +239,16 @@ if [[ $skip_frames == 0 ]]; then
   if [[ $DRY_RUN == 0 ]]; then write_manifest; fi
 else
   log "Skipping frames"
+fi
+
+# 4. Contact sheet — one image instead of a dozen, for handing frames to a
+#    chat model in a single attachment.
+if [[ $sheet == 1 ]]; then
+  if [[ $skip_frames == 1 ]]; then
+    log "Skipping sheet (--skip-frames leaves no frames to compose)"
+  else
+    run "$script_dir/vsheet" "$out_dir"
+  fi
 fi
 
 log "Done → $out_dir"
