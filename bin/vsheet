@@ -1,0 +1,158 @@
+#!/usr/bin/env bash
+#
+# vsheet — compose extracted frames into one labelled contact sheet.
+#
+# Built for handing a video's frames to a chat model as one attachment
+# instead of ten: burns each frame's timestamp into its corner, then tiles
+# them into a grid. A full-resolution frame from frames/ is still worth
+# pulling individually (see frames/index.tsv for exact timestamps) when a
+# detail — on-screen text, a UI element — needs a closer look than the sheet
+# gives it.
+
+set -euo pipefail
+
+readonly DEFAULT_COLS=3
+readonly DEFAULT_TILE_W=270
+readonly DEFAULT_TILE_H=480
+
+usage() {
+  cat <<'USAGE'
+Usage: vsheet OUT_DIR [options]
+
+Reads OUT_DIR/frames/index.tsv (written by vpipe) and composes every listed
+frame into one labelled grid image.
+
+Options:
+  -o, --out FILE       Output path (default: OUT_DIR/sheet.jpg)
+      --cols N         Grid columns (default: 3)
+      --tile-width N   Tile width in pixels (default: 270)
+      --tile-height N  Tile height in pixels (default: 480)
+      --font PATH      Font file for timestamp labels (default: auto-detect)
+      --no-labels      Skip timestamp burn-in, just tile the frames
+  -h, --help           Show this message
+
+Examples:
+  vsheet out/123
+  vsheet out/123 --cols 4 --out out/123/preview.jpg
+USAGE
+}
+
+die() { printf 'vsheet: %s\n' "$*" >&2; exit 1; }
+log() { printf '\033[1;34m==>\033[0m %s\n' "$*" >&2; }
+
+require() {
+  command -v "$1" >/dev/null 2>&1 || die "$1 not found. See the README for install instructions."
+}
+
+# Homebrew's ffmpeg is commonly built without fontconfig, so drawtext's
+# font=<family name> lookup fails there. Point at an actual font file
+# instead — checked across the platforms this pipeline targets.
+find_font() {
+  local candidates=(
+    "/System/Library/Fonts/Helvetica.ttc"
+    "/System/Library/Fonts/Supplemental/Arial.ttf"
+    "/Library/Fonts/Arial.ttf"
+    "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
+    "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf"
+    "/usr/share/fonts/truetype/liberation2/LiberationSans-Bold.ttf"
+  )
+  local f
+  for f in "${candidates[@]}"; do
+    [[ -f $f ]] && { printf '%s\n' "$f"; return 0; }
+  done
+  return 1
+}
+
+# seconds -> "M:SS", rounded to the nearest second — the sheet is for quick
+# orientation, not precision. index.tsv still has the exact value.
+mmss() {
+  awk -v s="$1" 'BEGIN{s=int(s+0.5); printf "%d:%02d", int(s/60), s%60}'
+}
+
+out_dir=""
+out_file=""
+cols=$DEFAULT_COLS
+tile_w=$DEFAULT_TILE_W
+tile_h=$DEFAULT_TILE_H
+font=""
+labels=1
+
+while [[ $# -gt 0 ]]; do
+  case $1 in
+    -o|--out)        out_file=${2:?--out needs a path}; shift 2 ;;
+    --cols)          cols=${2:?--cols needs a number}; shift 2 ;;
+    --tile-width)    tile_w=${2:?--tile-width needs a number}; shift 2 ;;
+    --tile-height)   tile_h=${2:?--tile-height needs a number}; shift 2 ;;
+    --font)          font=${2:?--font needs a path}; shift 2 ;;
+    --no-labels)     labels=0; shift ;;
+    -h|--help)       usage; exit 0 ;;
+    -*)              die "unknown option: $1 (try --help)" ;;
+    *)
+      [[ -n $out_dir ]] && die "only one directory at a time (got '$out_dir' and '$1')"
+      out_dir=$1; shift ;;
+  esac
+done
+
+[[ -n $out_dir ]] || { usage >&2; exit 2; }
+for n in "$cols:--cols" "$tile_w:--tile-width" "$tile_h:--tile-height"; do
+  [[ ${n%%:*} =~ ^[0-9]+$ ]] || die "${n#*:} must be a whole number, got '${n%%:*}'"
+done
+
+require ffmpeg
+
+tsv="$out_dir/frames/index.tsv"
+[[ -f $tsv ]] || die "no frame index at $tsv — run vpipe first"
+[[ -n $out_file ]] || out_file="$out_dir/sheet.jpg"
+
+# index.tsv is already written in timestamp order (hook frames, then body
+# frames) by vpipe's write_manifest, so no re-sort is needed here.
+files=() labels_text=()
+while IFS=$'\t' read -r file seconds segment; do
+  [[ $file == file ]] && continue  # header
+  files+=("$out_dir/frames/$file")
+  tag=$([[ $segment == hook ]] && echo H || echo B)
+  labels_text+=("$tag $(mmss "$seconds")")
+done < "$tsv"
+
+n=${#files[@]}
+[[ $n -gt 0 ]] || die "no frames listed in $tsv"
+
+if [[ $labels == 1 && -z $font ]]; then
+  font=$(find_font) || {
+    log "no font file found — building sheet without timestamp labels (pass --font PATH to add them)"
+    labels=0
+  }
+fi
+
+rows=$(( (n + cols - 1) / cols ))
+log "Composing $n frame(s) into a ${cols}x${rows} grid (tile ${tile_w}x${tile_h})"
+
+tmpdir=$(mktemp -d)
+trap 'rm -rf "$tmpdir"' EXIT
+
+for i in "${!files[@]}"; do
+  dest="$tmpdir/$(printf '%03d' "$i").jpg"
+  vf="scale=${tile_w}:${tile_h}:force_original_aspect_ratio=decrease,pad=${tile_w}:${tile_h}:(ow-iw)/2:(oh-ih)/2:color=black"
+  if [[ $labels == 1 ]]; then
+    # Colons in the label ("H 0:07") are filter-syntax separators to
+    # drawtext, so escape them — everything else in the label is plain text.
+    text_esc=${labels_text[$i]//:/\\:}
+    vf+=",drawtext=fontfile='${font}':text='${text_esc}':x=8:y=8:fontsize=28:fontcolor=white:box=1:boxcolor=black@0.6:boxborderw=6"
+  fi
+  ffmpeg -nostdin -loglevel error -y -i "${files[$i]}" -vf "$vf" -frames:v 1 "$dest"
+done
+
+# tile requires exactly cols*rows input frames — pad a partial last row with
+# blank filler rather than fail or leave the grid ragged.
+if [[ $n -lt $((cols * rows)) ]]; then
+  filler="$tmpdir/filler.jpg"
+  ffmpeg -nostdin -loglevel error -y -f lavfi -i "color=c=black:s=${tile_w}x${tile_h}" -frames:v 1 "$filler"
+  for ((i = n; i < cols * rows; i++)); do
+    cp "$filler" "$tmpdir/$(printf '%03d' "$i").jpg"
+  done
+  rm -f "$filler"
+fi
+
+ffmpeg -nostdin -loglevel error -y -pattern_type glob -i "$tmpdir/*.jpg" -vf "tile=${cols}x${rows}" -frames:v 1 "$out_file"
+
+log "Contact sheet → $out_file"
