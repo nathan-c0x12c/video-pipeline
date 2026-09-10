@@ -158,7 +158,8 @@ Claude Code, `bin/vpipe-app` runs the same pipeline behind a local page:
 ./bin/vpipe-app
 ```
 
-Opens `http://127.0.0.1:8765`. Drop a video (or paste a URL — TikTok isn't
+Opens `http://127.0.0.1:8765`. Started twice, the second one notices the first
+and just opens the page rather than failing on the bound port. Drop a video (or paste a URL — TikTok isn't
 blocked on a normal home network the way it can be in a sandboxed session),
 and it downloads, transcribes, extracts frames, and builds a `sheet.jpg`
 automatically. The page shows the transcript and frames, and lets you drop in

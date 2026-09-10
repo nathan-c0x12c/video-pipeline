@@ -15,6 +15,7 @@ this adds nothing new to install. Binds to 127.0.0.1 only.
 
 from __future__ import annotations
 
+import errno
 import json
 import mimetypes
 import re
@@ -27,6 +28,7 @@ import webbrowser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import unquote
+from urllib.request import urlopen
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 BIN_DIR = REPO_ROOT / "bin"
@@ -786,14 +788,43 @@ class Handler(BaseHTTPRequestHandler):
         sys.stderr.write("%s - %s\n" % (self.address_string(), fmt % args))
 
 
+def already_running(url: str) -> bool:
+    """Is the thing on our port this app, or something else entirely?"""
+    try:
+        # Generous: this check runs while the machine may be busy transcribing,
+        # and a timeout here misreports the app as a foreign process.
+        with urlopen(f"{url}capabilities", timeout=8) as resp:
+            return "backends" in json.loads(resp.read().decode("utf-8"))
+    except Exception:  # noqa: BLE001 - unreachable or not us
+        return False
+
+
 def main() -> None:
     if not VPIPE.exists():
         print(f"error: {VPIPE} not found — run this from the video-pipeline repo", file=sys.stderr)
         sys.exit(1)
 
     OUT_ROOT.mkdir(exist_ok=True)
-    server = ThreadingHTTPServer((HOST, PORT), Handler)
     url = f"http://{HOST}:{PORT}/"
+
+    try:
+        server = ThreadingHTTPServer((HOST, PORT), Handler)
+    except OSError as e:
+        if e.errno != errno.EADDRINUSE:
+            raise
+        # Almost always this is the app already running — starting it twice is
+        # an easy thing to do. Opening the page you wanted beats a traceback.
+        if already_running(url):
+            print(f"vpipe-app is already running at {url} — opening it")
+            webbrowser.open(url)
+            return
+        print(
+            f"error: port {PORT} is in use by something else.\n"
+            f"       Close it, or find it with:  lsof -nP -iTCP:{PORT} -sTCP:LISTEN",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
     print(f"vpipe-app running at {url}  (Ctrl+C to stop)")
     threading.Timer(0.5, lambda: webbrowser.open(url)).start()
     try:
