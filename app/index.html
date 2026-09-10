@@ -113,6 +113,15 @@
     font-size: 13px;
   }
   .muted { color: var(--muted); font-size: 12px; }
+  .warn { color: #ffb4a2; }
+  select {
+    background: #2a2c33;
+    color: var(--text);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 6px 10px;
+    font-size: 13px;
+  }
   .screenshot-list { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; }
   .screenshot-list span { background: #2a2c33; border-radius: 4px; padding: 3px 8px; font-size: 11px; }
 </style>
@@ -129,6 +138,12 @@
       <input type="text" id="urlInput" placeholder="or paste a TikTok / IG / YouTube Shorts URL">
       <button id="urlBtn">Fetch</button>
     </div>
+    <div class="row" style="margin-top:12px">
+      <label class="muted" for="asrModel">Transcription quality</label>
+      <select id="asrModel"></select>
+      <span class="muted" id="asrHint"></span>
+    </div>
+    <div class="muted warn hidden" id="setupWarn" style="margin-top:10px"></div>
   </div>
 
   <div class="panel hidden" id="status-panel">
@@ -167,27 +182,57 @@
   </div>
 
   <div class="panel hidden" id="prompt-panel">
-    <h2>5. Send it to a model</h2>
+    <h2>5. Run the teardown</h2>
+
     <div class="row">
-      <button id="copyBtn">Copy prompt</button>
-      <button class="secondary" id="openFolderBtn">Open folder</button>
-      <span class="muted" id="copyStatus"></span>
+      <label class="muted" for="backendSel">Analyze with</label>
+      <select id="backendSel"></select>
+      <label class="muted" for="claudeModel">model</label>
+      <select id="claudeModel"></select>
+      <button id="analyzeBtn">Analyze here</button>
+      <span class="muted" id="analyzeStatus"></span>
     </div>
-    <div class="links" style="margin-top:10px">
-      <a href="https://claude.ai/new" target="_blank">Open Claude</a>
-      <a href="https://chatgpt.com/" target="_blank">Open ChatGPT</a>
-      <a href="https://gemini.google.com/app" target="_blank">Open Gemini</a>
+
+    <div class="row hidden" id="signinRow" style="margin-top:10px">
+      <span class="muted warn" id="signinMsg"></span>
+      <button id="signinBtn">Sign in</button>
+      <span class="muted" id="signinStatus"></span>
     </div>
-    <textarea id="promptBox" rows="10" readonly style="margin-top:10px" placeholder="Click Copy prompt to generate it"></textarea>
+
+    <div class="muted" style="margin-top:8px">
+      Runs on this machine through a CLI you're already signed in to — no API
+      key, nothing billed per video. Writes <code>teardown.md</code> next to
+      the video when it's done.
+    </div>
+    <div class="muted warn hidden" id="analyzeError" style="margin-top:8px"></div>
+
+    <details style="margin-top:16px">
+      <summary class="muted">Or copy the prompt and paste it into a chat instead</summary>
+      <div class="row" style="margin-top:10px">
+        <button class="secondary" id="copyBtn">Copy prompt</button>
+        <button class="secondary" id="openFolderBtn">Open folder</button>
+        <span class="muted" id="copyStatus"></span>
+      </div>
+      <div class="links" style="margin-top:10px">
+        <a href="https://claude.ai/new" target="_blank">Open Claude</a>
+        <a href="https://chatgpt.com/" target="_blank">Open ChatGPT</a>
+        <a href="https://gemini.google.com/app" target="_blank">Open Gemini</a>
+      </div>
+      <textarea id="promptBox" rows="10" readonly style="margin-top:10px" placeholder="Click Copy prompt to generate it"></textarea>
+    </details>
   </div>
 
   <div class="panel hidden" id="report-panel">
-    <h2>6. Paste the report back</h2>
-    <textarea id="reportInput" rows="12" placeholder="Paste the model's teardown here"></textarea>
-    <div class="row" style="margin-top:8px">
-      <button id="saveReportBtn">Save as teardown.md</button>
-      <span class="muted" id="reportStatus"></span>
-    </div>
+    <h2>6. The teardown</h2>
+    <pre class="transcript hidden" id="teardownBox"></pre>
+    <details style="margin-top:10px" id="pasteBack">
+      <summary class="muted">Paste a report back from a chat instead</summary>
+      <textarea id="reportInput" rows="12" placeholder="Paste the model's teardown here" style="margin-top:10px"></textarea>
+      <div class="row" style="margin-top:8px">
+        <button id="saveReportBtn">Save as teardown.md</button>
+        <span class="muted" id="reportStatus"></span>
+      </div>
+    </details>
   </div>
 </div>
 
@@ -198,54 +243,234 @@ let pollTimer = null;
 
 const $ = (id) => document.getElementById(id);
 const show = (id) => $(id).classList.remove('hidden');
+const hide = (id) => $(id).classList.add('hidden');
 
-function setPill(state) {
-  const pill = $('statePill');
-  pill.textContent = state;
-  pill.className = 'pill ' + state;
+// What the transcription models actually cost you, in the terms that matter
+// when you're picking one: speed against accuracy.
+const ASR_BLURB = {
+  'tiny': 'fastest, roughest',
+  'tiny.en': 'fastest, English only',
+  'base': 'fast, fine for clear speech',
+  'base.en': 'fast, English only',
+  'small': 'good default',
+  'small.en': 'good default, English only',
+  'medium': 'slowest, best on accents and noise',
+  'medium.en': 'slowest, best on English',
+};
+const CLAUDE_BLURB = {
+  'opus': 'most capable',
+  'sonnet': 'faster, still strong',
+  'haiku': 'fastest, lightest',
+};
+
+let caps = null;
+let backends = {};       // name -> state from the server
+let authReady = false;
+
+function currentBackend() {
+  return backends[$('backendSel').value] || null;
 }
 
-async function startJob(promise) {
-  show('status-panel');
-  setPill('queued');
-  $('logBox').textContent = '';
-  const data = await promise;
-  jobId = data.job_id;
-  if (data.out_dir) outDir = data.out_dir;
-  poll();
+async function loadCapabilities() {
+  caps = await fetch('/capabilities').then(r => r.json());
+
+  const asr = $('asrModel');
+  asr.innerHTML = '';
+  caps.asr_models.forEach(m => {
+    const o = document.createElement('option');
+    o.value = m;
+    o.textContent = m;
+    if (m === caps.default_asr_model) o.selected = true;
+    asr.appendChild(o);
+  });
+  const updateHint = () => { $('asrHint').textContent = ASR_BLURB[asr.value] || ''; };
+  asr.addEventListener('change', updateHint);
+  updateHint();
+
+  // Offer whichever CLIs are actually installed, and prefer one that's
+  // already signed in so the common case needs no setup at all.
+  const sel = $('backendSel');
+  sel.innerHTML = '';
+  const installed = caps.backends.filter(b => b.installed);
+  (installed.length ? installed : caps.backends).forEach(b => {
+    const o = document.createElement('option');
+    o.value = b.name;
+    o.textContent = b.label;
+    sel.appendChild(o);
+  });
+  const ready = installed.find(b => b.logged_in);
+  if (ready) sel.value = ready.name;
+
+  applyBackends(caps.backends);
+  sel.addEventListener('change', () => { applyBackends(Object.values(backends)); });
+
+  const missing = [];
+  if (!caps.has_ffmpeg) missing.push('ffmpeg is not installed — nothing will run until it is');
+  if (!caps.has_ytdlp) missing.push('yt-dlp is not installed — you can upload files, but pasting a URL will fail');
+  if (!caps.backends.some(b => b.installed)) {
+    missing.push('neither `claude` nor `codex` is installed — use the copy-the-prompt route instead');
+  }
+  if (missing.length) {
+    $('setupWarn').innerHTML = missing.map(m => '⚠ ' + m).join('<br>');
+    show('setupWarn');
+  }
 }
 
-function pickFile() { $('fileInput').click(); }
+// One place decides what the analyze controls look like, so the sign-in row,
+// the model list and the button can't disagree about the selected backend.
+function applyBackends(list) {
+  list.forEach(b => { backends[b.name] = b; });
+  const b = currentBackend();
+  if (!b) return;
 
-$('dropzone').addEventListener('click', pickFile);
-$('dropzone').addEventListener('dragover', (e) => { e.preventDefault(); $('dropzone').classList.add('hover'); });
-$('dropzone').addEventListener('dragleave', () => $('dropzone').classList.remove('hover'));
-$('dropzone').addEventListener('drop', (e) => {
-  e.preventDefault();
-  $('dropzone').classList.remove('hover');
-  const file = e.dataTransfer.files[0];
-  if (file) uploadFile(file);
-});
-$('fileInput').addEventListener('change', (e) => {
-  if (e.target.files[0]) uploadFile(e.target.files[0]);
-});
+  const model = $('claudeModel');
+  model.innerHTML = '';
+  b.models.forEach(m => {
+    const o = document.createElement('option');
+    o.value = m;
+    o.textContent = b.name === 'claude' ? m + ' — ' + (CLAUDE_BLURB[m] || '') : m;
+    if (m === b.default_model) o.selected = true;
+    model.appendChild(o);
+  });
+  // Codex takes its model from ~/.codex/config.toml, so there's nothing to
+  // choose here — showing it disabled beats pretending it's a choice.
+  model.disabled = b.name === 'codex' || !b.installed || !b.logged_in;
 
-function uploadFile(file) {
-  startJob(fetch('/upload', {
-    method: 'POST',
-    headers: { 'X-Filename': encodeURIComponent(file.name) },
-    body: file,
-  }).then(r => r.json()));
+  authReady = b.installed && b.logged_in;
+  $('analyzeBtn').disabled = !authReady;
+  $('signinRow').classList.toggle('hidden', authReady);
+
+  if (!b.installed) {
+    $('signinMsg').textContent = b.label + " isn't installed — " + b.install_hint;
+    $('signinBtn').classList.add('hidden');
+  } else if (!b.logged_in) {
+    $('signinMsg').textContent = b.label + " isn't signed in yet.";
+    $('signinBtn').textContent = 'Sign in to ' + b.label;
+    $('signinBtn').classList.remove('hidden');
+  }
+  if (authReady) hide('analyzeError');
 }
 
-$('urlBtn').addEventListener('click', () => {
-  const url = $('urlInput').value.trim();
-  if (!url) return;
-  startJob(fetch('/url', {
+// Sign-in happens in a Terminal window, so there's no callback to wait on —
+// poll until the CLI reports itself signed in, then light the button up.
+let authTimer = null;
+let authTries = 0;
+
+function watchForLogin() {
+  clearTimeout(authTimer);
+  fetch('/auth-status').then(r => r.json()).then(d => {
+    applyBackends(d.backends);
+    if (authReady) {
+      $('signinStatus').textContent = '';
+      $('analyzeStatus').textContent = 'signed in — ready to analyze';
+      return;
+    }
+    if (++authTries > 150) {   // ~5 minutes, then stop nagging the CLI
+      $('signinStatus').textContent = 'still not signed in — press Sign in again when ready';
+      return;
+    }
+    authTimer = setTimeout(watchForLogin, 2000);
+  });
+}
+
+$('signinBtn').addEventListener('click', () => {
+  const b = currentBackend();
+  if (!b) return;
+  $('signinStatus').textContent = 'opening Terminal — finish signing in there…';
+  fetch('/login', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ url }),
-  }).then(r => r.json()));
+    body: JSON.stringify({ backend: b.name }),
+  }).then(r => r.json()).then(d => {
+    if (d.error) {
+      $('signinStatus').textContent = d.error;
+      return;
+    }
+    authTries = 0;
+    watchForLogin();
+  });
+});
+
+loadCapabilities();
+
+let analysisTimer = null;
+
+function renderAnalysis(data) {
+  const state = data.analysis_state;
+  const status = $('analyzeStatus');
+
+  if (state === 'running') {
+    status.textContent = 'running ' + (data.analysis_model || '') +
+      ' — reading the frames, this takes a minute or two…';
+    $('signinRow').classList.add('hidden');
+    $('analyzeBtn').disabled = true;
+    hide('analyzeError');
+  } else if (state === 'done') {
+    status.textContent = 'saved to ' + outDir + '/teardown.md';
+    $('analyzeBtn').disabled = !authReady;
+    $('analyzeBtn').textContent = 'Run again';
+    hide('analyzeError');
+  } else if (state === 'error') {
+    status.textContent = '';
+    $('analyzeBtn').disabled = !authReady;
+    $('analyzeError').textContent = data.analysis_error || 'analysis failed';
+    show('analyzeError');
+    // A session can expire between page load and pressing Analyze, so an auth
+    // failure has to be able to bring the sign-in row back on its own. Ask the
+    // server rather than assuming which backend dropped out.
+    if (/signed in/i.test(data.analysis_error || '')) {
+      fetch('/auth-status').then(r => r.json()).then(d => {
+        applyBackends(d.backends);
+        show('analyzeError');
+      });
+    }
+  } else {
+    status.textContent = '';
+    $('analyzeBtn').disabled = !authReady;
+  }
+
+  if (data.teardown) {
+    $('teardownBox').textContent = data.teardown;
+    show('teardownBox');
+    // The paste-back box is a fallback; once there's a real report, fold it away.
+    $('pasteBack').open = false;
+  }
+}
+
+// The main poll stops once the pipeline is done, so analysis gets its own loop.
+function pollAnalysis() {
+  clearTimeout(analysisTimer);
+  fetch('/status/' + encodeURIComponent(jobId)).then(r => r.json()).then(data => {
+    renderAnalysis(data);
+    if (data.analysis_state === 'running') {
+      analysisTimer = setTimeout(pollAnalysis, 2000);
+    }
+  });
+}
+
+$('analyzeBtn').addEventListener('click', () => {
+  if (!jobId) return;
+  hide('analyzeError');
+  $('analyzeBtn').disabled = true;
+  $('analyzeStatus').textContent = 'starting…';
+  fetch('/analyze', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      job_id: jobId,
+      backend: $('backendSel').value,
+      model: $('claudeModel').value,
+    }),
+  }).then(r => r.json()).then(data => {
+    if (data.error) {
+      $('analyzeStatus').textContent = '';
+      $('analyzeError').textContent = data.error;
+      show('analyzeError');
+      $('analyzeBtn').disabled = !authReady;
+      return;
+    }
+    pollAnalysis();
+  });
 });
 
 function poll() {
@@ -267,6 +492,7 @@ function poll() {
       show('meta-panel');
       show('prompt-panel');
       show('report-panel');
+      renderAnalysis(data);
       return;
     }
     if (data.state === 'error') {
