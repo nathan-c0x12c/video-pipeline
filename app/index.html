@@ -332,9 +332,7 @@ function applyBackends(list) {
     if (m === b.default_model) o.selected = true;
     model.appendChild(o);
   });
-  // Codex takes its model from ~/.codex/config.toml, so there's nothing to
-  // choose here — showing it disabled beats pretending it's a choice.
-  model.disabled = b.name === 'codex' || !b.installed || !b.logged_in;
+  model.disabled = !b.installed || !b.logged_in;
 
   authReady = b.installed && b.logged_in;
   $('analyzeBtn').disabled = !authReady;

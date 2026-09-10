@@ -71,6 +71,24 @@ AUTH_RE = re.compile(r"authenticat|oauth|login|credential|not logged in", re.I)
 
 CODEX_CONFIG = Path.home() / ".codex" / "config.toml"
 
+# Codex has no "list models" command, so this is read out of the shipped
+# binary's own strings and curated down to the ones worth offering here.
+# Whatever `~/.codex/config.toml` says is always included and always leads the
+# list, so a model newer than this file stays reachable without an edit.
+CODEX_MODELS = [
+    "gpt-6-astra",
+    "gpt-6",
+    "gpt-5.6-sol",
+    "gpt-5.6-luna",
+    "gpt-5.6-terra",
+    "gpt-5.5",
+    "gpt-5.4",
+    "gpt-5.4-mini",
+    "gpt-5.3-codex",
+    "gpt-5.2",
+    "gpt-5.1-codex-max",
+]
+
 
 def codex_model() -> str:
     """Report the model Codex is configured to use.
@@ -124,8 +142,8 @@ def backend_state(name: str) -> dict:
         "label": "ChatGPT (Codex)",
         "installed": bool(CODEX_BIN),
         "logged_in": codex_logged_in(),
-        # Codex takes its model from its own config; see codex_model().
-        "models": [codex_model()],
+        # Config value first so it's the default, then the rest.
+        "models": [codex_model()] + [m for m in CODEX_MODELS if m != codex_model()],
         "default_model": codex_model(),
         "install_hint": "npm install -g --prefix ~/.local @openai/codex",
     }
@@ -750,11 +768,16 @@ class Handler(BaseHTTPRequestHandler):
                 self._send_json({"error": "an analysis is already running"}, 409)
                 return
 
-            requested = data.get("model")
+            requested = (data.get("model") or "").strip()
             if backend == "claude":
                 model = pick_claude_model(requested)
             else:
-                model = state["default_model"]
+                # Allowlisted for the same reason as everything else here: it
+                # goes into an argv.
+                model = (
+                    requested if requested in state["models"]
+                    else state["default_model"]
+                )
 
             threading.Thread(
                 target=run_analysis,
