@@ -393,6 +393,58 @@ $('signinBtn').addEventListener('click', () => {
 
 loadCapabilities();
 
+function setPill(state) {
+  const pill = $('statePill');
+  pill.textContent = state;
+  pill.className = 'pill ' + state;
+}
+
+async function startJob(promise) {
+  show('status-panel');
+  setPill('queued');
+  $('logBox').textContent = '';
+  const data = await promise;
+  jobId = data.job_id;
+  if (data.out_dir) outDir = data.out_dir;
+  poll();
+}
+
+function pickFile() { $('fileInput').click(); }
+
+$('dropzone').addEventListener('click', pickFile);
+$('dropzone').addEventListener('dragover', (e) => { e.preventDefault(); $('dropzone').classList.add('hover'); });
+$('dropzone').addEventListener('dragleave', () => $('dropzone').classList.remove('hover'));
+$('dropzone').addEventListener('drop', (e) => {
+  e.preventDefault();
+  $('dropzone').classList.remove('hover');
+  const file = e.dataTransfer.files[0];
+  if (file) uploadFile(file);
+});
+$('fileInput').addEventListener('change', (e) => {
+  if (e.target.files[0]) uploadFile(e.target.files[0]);
+});
+
+function uploadFile(file) {
+  startJob(fetch('/upload', {
+    method: 'POST',
+    headers: {
+      'X-Filename': encodeURIComponent(file.name),
+      'X-Asr-Model': $('asrModel').value,
+    },
+    body: file,
+  }).then(r => r.json()));
+}
+
+$('urlBtn').addEventListener('click', () => {
+  const url = $('urlInput').value.trim();
+  if (!url) return;
+  startJob(fetch('/url', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ url, asr_model: $('asrModel').value }),
+  }).then(r => r.json()));
+});
+
 let analysisTimer = null;
 
 function renderAnalysis(data) {
